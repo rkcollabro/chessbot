@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "board.h"
+#include "book.h"
 #include "search.h"
 #include "tablebase.h"
 
@@ -222,7 +223,9 @@ void startEngine() {
         Move m = findBestMove(copy, ms, &g.engineStop, [&](const SearchInfo& si) {
             int whiteScore = engineWhite ? si.score : -si.score;
             char buf[160];
-            if (si.note.empty()) {
+            if (si.note == "Opening book") {
+                snprintf(buf, sizeof(buf), "Book move");
+            } else if (si.note.empty()) {
                 double knps = si.ms > 0 ? double(si.nodes) / si.ms : 0;
                 snprintf(buf, sizeof(buf), "Depth %d   Eval %s   %.2fM nodes   %.0f knps", si.depth,
                          scoreToString(whiteScore).c_str(), si.nodes / 1e6, knps);
@@ -234,7 +237,7 @@ void startEngine() {
             g.pvLine = si.pv;
             g.tbNote = si.note;
             PostMessage(hwnd, WM_REFRESH, 0, 0);
-        });
+        }, true);
         PostMessage(hwnd, WM_ENGINE_DONE, gen, LPARAM(m));
     });
 }
@@ -710,6 +713,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     g.hwnd = CreateWindowW(wc.lpszClassName, L"ChessBot", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                            S(1120), S(800), nullptr, buildMenu(), inst, nullptr);
     updateTimeMenu();
+
+    book::load(exeDir() + "\\book.bin");
 
     // Load (or build, on first run) the endgame tables in the background.
     tb::init(exeDir() + "\\tb");

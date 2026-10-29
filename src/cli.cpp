@@ -4,14 +4,21 @@
 //   chesscli tbgen                build/load all tablebases and print stats
 //   chesscli tbprobe <fen>
 //   chesscli search <ms> [fen]
+//   chesscli uci                  UCI protocol on stdin/stdout
+//   chesscli mkbook <out.bin> <maxply> <pgn>...
+//   chesscli extract <out.txt> <perGame> <maxPositions> <pgn>...
+//   chesscli tune <data.txt> <out.inc> [epochs]
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #include "board.h"
+#include "datagen.h"
 #include "search.h"
 #include "tablebase.h"
+#include "uci.h"
 
 static bool g_checkHash = false;
 static bool g_hashOk = true;
@@ -49,6 +56,18 @@ int main(int argc, char** argv) {
     auto ms = [&] {
         return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     };
+
+    if (cmd == "uci") {
+        uciLoop(exeDir(argv[0]) + "/tb", exeDir(argv[0]) + "/book.bin");
+        return 0;
+    }
+
+    if (cmd == "mkbook" && argc > 4)
+        return buildBook(argv[2], std::atoi(argv[3]), std::vector<std::string>(argv + 4, argv + argc));
+    if (cmd == "extract" && argc > 5)
+        return extractPositions(argv[2], std::atoi(argv[3]), std::atoi(argv[4]),
+                                std::vector<std::string>(argv + 5, argv + argc));
+    if (cmd == "tune" && argc > 3) return tune(argv[2], argv[3], argc > 4 ? std::atoi(argv[4]) : 300);
 
     if (cmd == "test") {
         struct Case { const char* fen; int depth; uint64_t expected; };

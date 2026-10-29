@@ -2,3 +2,5 @@ build/
 *.exe
 *.obj
 tb/
+data/
+engines/

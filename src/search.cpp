@@ -8,6 +8,7 @@
 #include <memory>
 #include <vector>
 
+#include "book.h"
 #include "eval.h"
 #include "tablebase.h"
 
@@ -47,6 +48,49 @@ int tbScore(int v, int ply) {
     return 0;
 }
 
+// Static exchange evaluation: material outcome of the capture sequence on the target square,
+// with both sides always recapturing with their least valuable piece.
+int see(const Board& b, Move m) {
+    int from = moveFrom(m), to = moveTo(m);
+    int gain[32], d = 0;
+    int target = (moveFlags(m) & MF_EP) ? PAWN : typeOf(b.sq[to]);
+    int attacker = typeOf(b.sq[from]);
+    gain[0] = PIECE_VALUE[target];
+    if (movePromo(m)) {
+        gain[0] += PIECE_VALUE[movePromo(m)] - PIECE_VALUE[PAWN];
+        attacker = movePromo(m);
+    }
+    Bitboard occ = b.occAll ^ bit(from);
+    if (moveFlags(m) & MF_EP) occ ^= bit(to + (b.stm == WHITE ? -8 : 8));
+    const Bitboard diag = b.bb(0, BISHOP) | b.bb(1, BISHOP) | b.bb(0, QUEEN) | b.bb(1, QUEEN);
+    const Bitboard orth = b.bb(0, ROOK) | b.bb(1, ROOK) | b.bb(0, QUEEN) | b.bb(1, QUEEN);
+    Bitboard attackers = b.attackersTo(to, occ) & occ;
+    int side = b.stm ^ 1;
+    while (true) {
+        Bitboard mine = attackers & b.occ[side];
+        if (!mine) break;
+        int t = PAWN;
+        Bitboard pick = 0;
+        for (; t <= KING; t++)
+            if ((pick = mine & b.bb(side, t))) break;
+        // A king may not recapture into a square the opponent still defends.
+        if (t == KING && (attackers & b.occ[side ^ 1])) break;
+        d++;
+        gain[d] = PIECE_VALUE[attacker] - gain[d - 1];
+        if (std::max(-gain[d - 1], gain[d]) < 0) break;
+        occ ^= pick & (0 - pick);
+        attackers |= (attacks::bishop(to, occ) & diag) | (attacks::rook(to, occ) & orth);
+        attackers &= occ;
+        attacker = t;
+        side ^= 1;
+    }
+    while (d > 0) {
+        gain[d - 1] = -std::max(-gain[d - 1], gain[d]);
+        d--;
+    }
+    return gain[0];
+}
+
 using Clock = std::chrono::steady_clock;
 
 class Searcher {
@@ -63,6 +107,7 @@ public:
     int pvLen[MAX_PLY];
     Move rootBest = NO_MOVE;
     int rootScore = 0;
+    bool useBook = false;
 
     int elapsed() const {
         return int(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count());
@@ -79,7 +124,11 @@ public:
         if (isCapture(m)) {
             int victim = (moveFlags(m) & MF_EP) ? PAWN : typeOf(b.sq[moveTo(m)]);
             int attacker = typeOf(b.sq[moveFrom(m)]);
-            return 1000000 + PIECE_VALUE[victim] * 10 - PIECE_VALUE[attacker] / 10 + (promo == QUEEN ? 9000 : 0);
+            int mvvLva = PIECE_VALUE[victim] * 10 - PIECE_VALUE[attacker] / 100 + (promo == QUEEN ? 9000 : 0);
+            // Captures that lose material in the exchange go after the quiet moves.
+            if (attacker != PAWN && PIECE_VALUE[victim] < PIECE_VALUE[attacker] && see(b, m) < 0)
+                return -200000 + mvvLva;
+            return 1000000 + mvvLva;
         }
         if (promo == QUEEN) return 950000;
         if (promo) return -100000;  // underpromotions last
@@ -121,6 +170,13 @@ public:
         for (int i = 0; i < ml.count; i++) {
             pickMove(ml, scores, i);
             Move m = ml.moves[i];
+            if (!inCheck) {
+                // Losing captures and underpromotions are sorted last: nothing useful remains.
+                if (scores[i] < 0) break;
+                // Delta pruning: even winning this piece cannot lift the score to alpha.
+                int victim = (moveFlags(m) & MF_EP) ? PAWN : typeOf(b.sq[moveTo(m)]);
+                if (!movePromo(m) && best + PIECE_VALUE[victim] + 200 < alpha) continue;
+            }
             if (!b.makeMove(m)) continue;
             legal++;
             int s = -qsearch(-beta, -alpha, ply + 1);
@@ -315,6 +371,15 @@ public:
 
         Move best = NO_MOVE;
         if (tablebaseRoot(best, info)) return best;
+        if (useBook && book::loaded() && (best = book::probe(b))) {
+            if (info) {
+                SearchInfo si;
+                si.pv = pvToSAN(&best, 1);
+                si.note = "Opening book";
+                info(si);
+            }
+            return best;
+        }
 
         MoveList legal;
         b.genLegal(legal);
@@ -346,12 +411,20 @@ public:
 
 }  // namespace
 
-Move findBestMove(const Board& root, int timeMs, std::atomic<bool>* stop, const InfoFn& info) {
+Move findBestMove(const Board& root, int timeMs, std::atomic<bool>* stop, const InfoFn& info, bool useBook) {
     auto s = std::make_unique<Searcher>();
     s->b = root;
     s->limitMs = timeMs;
     s->stopFlag = stop;
+    s->useBook = useBook;
     return s->think(info);
+}
+
+int quiescenceScore(const Board& pos) {
+    auto s = std::make_unique<Searcher>();
+    s->b = pos;
+    s->limitMs = 1 << 30;
+    return s->qsearch(-INF, INF, 0);
 }
 
 void clearSearchMemory() {

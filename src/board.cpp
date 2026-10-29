@@ -6,9 +6,9 @@
 
 namespace {
 
-int knightTo[64][8], knightN[64];
-int kingTo[64][8], kingN[64];
-int rays[64][8][7], rayN[64][8];  // dirs 0-3 orthogonal, 4-7 diagonal
+Bitboard PAWN_ATT[2][64], KNIGHT_ATT[64], KING_ATT[64];
+Bitboard RAY[8][64];  // N, E, NE, NW (increasing), S, W, SE, SW (decreasing)
+Bitboard LINES[64];   // all eight rays from a square on an empty board
 int castleMask[64];
 
 uint64_t Z_piece[16][64], Z_side, Z_castle[16], Z_ep[8];
@@ -20,9 +20,32 @@ uint64_t splitmix(uint64_t& x) {
     return z ^ (z >> 31);
 }
 
-const int WP = 1, BP = 9;
-
 }  // namespace
+
+namespace attacks {
+Bitboard pawn(int color, int s) { return PAWN_ATT[color][s]; }
+Bitboard knight(int s) { return KNIGHT_ATT[s]; }
+Bitboard king(int s) { return KING_ATT[s]; }
+// Classical ray attacks: the nearest blocker along each ray cuts off the rest of the ray.
+Bitboard bishop(int s, Bitboard occ) {
+    Bitboard a = 0;
+    for (int d : {2, 3, 6, 7}) {
+        Bitboard r = RAY[d][s], blockers = r & occ;
+        if (blockers) r ^= RAY[d][d < 4 ? lsb(blockers) : msb(blockers)];
+        a |= r;
+    }
+    return a;
+}
+Bitboard rook(int s, Bitboard occ) {
+    Bitboard a = 0;
+    for (int d : {0, 1, 4, 5}) {
+        Bitboard r = RAY[d][s], blockers = r & occ;
+        if (blockers) r ^= RAY[d][d < 4 ? lsb(blockers) : msb(blockers)];
+        a |= r;
+    }
+    return a;
+}
+}  // namespace attacks
 
 void initTables() {
     static bool done = false;
@@ -30,24 +53,28 @@ void initTables() {
     done = true;
 
     const int KN[8][2] = {{1, 2}, {2, 1}, {2, -1}, {1, -2}, {-1, -2}, {-2, -1}, {-2, 1}, {-1, 2}};
-    const int DF[8] = {0, 0, 1, -1, 1, -1, 1, -1};
-    const int DR[8] = {1, -1, 0, 0, 1, 1, -1, -1};
+    const int KG[8][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+    // Ray directions (df, dr) in the order used by RAY.
+    const int DIR[8][2] = {{0, 1}, {1, 0}, {1, 1}, {-1, 1}, {0, -1}, {-1, 0}, {1, -1}, {-1, -1}};
+    auto on = [](int f, int r) { return f >= 0 && f < 8 && r >= 0 && r < 8; };
     for (int s = 0; s < 64; s++) {
         int f = fileOf(s), r = rankOf(s);
-        knightN[s] = kingN[s] = 0;
-        for (auto& k : KN) {
-            int nf = f + k[0], nr = r + k[1];
-            if (nf >= 0 && nf < 8 && nr >= 0 && nr < 8) knightTo[s][knightN[s]++] = nr * 8 + nf;
+        KNIGHT_ATT[s] = KING_ATT[s] = 0;
+        for (auto& k : KN)
+            if (on(f + k[0], r + k[1])) KNIGHT_ATT[s] |= bit((r + k[1]) * 8 + f + k[0]);
+        for (auto& k : KG)
+            if (on(f + k[0], r + k[1])) KING_ATT[s] |= bit((r + k[1]) * 8 + f + k[0]);
+        PAWN_ATT[0][s] = PAWN_ATT[1][s] = 0;
+        LINES[s] = 0;
+        for (int df : {-1, 1}) {
+            if (on(f + df, r + 1)) PAWN_ATT[WHITE][s] |= bit((r + 1) * 8 + f + df);
+            if (on(f + df, r - 1)) PAWN_ATT[BLACK][s] |= bit((r - 1) * 8 + f + df);
         }
         for (int d = 0; d < 8; d++) {
-            int nf = f + DF[d], nr = r + DR[d];
-            if (nf >= 0 && nf < 8 && nr >= 0 && nr < 8) kingTo[s][kingN[s]++] = nr * 8 + nf;
-            rayN[s][d] = 0;
-            while (nf >= 0 && nf < 8 && nr >= 0 && nr < 8) {
-                rays[s][d][rayN[s][d]++] = nr * 8 + nf;
-                nf += DF[d];
-                nr += DR[d];
-            }
+            RAY[d][s] = 0;
+            for (int nf = f + DIR[d][0], nr = r + DIR[d][1]; on(nf, nr); nf += DIR[d][0], nr += DIR[d][1])
+                RAY[d][s] |= bit(nr * 8 + nf);
+            LINES[s] |= RAY[d][s];
         }
         castleMask[s] = 15;
     }
@@ -80,6 +107,8 @@ Board::Board() {
 
 void Board::clear() {
     std::memset(sq, 0, sizeof(sq));
+    std::memset(pieces, 0, sizeof(pieces));
+    occ[0] = occ[1] = occAll = 0;
     stm = WHITE;
     castle = 0;
     ep = -1;
@@ -88,14 +117,36 @@ void Board::clear() {
     hash = 0;
     kingSq[0] = kingSq[1] = -1;
     pieceCount = 0;
+    checkCache = -1;
     undoStack.clear();
     hashHistory.clear();
 }
 
+inline void Board::addPiece(int s, int p) {
+    sq[s] = p;
+    Bitboard b = bit(s);
+    pieces[colorOf(p)][typeOf(p)] |= b;
+    occ[colorOf(p)] |= b;
+    occAll |= b;
+}
+
+inline void Board::removePiece(int s) {
+    int p = sq[s];
+    Bitboard b = ~bit(s);
+    pieces[colorOf(p)][typeOf(p)] &= b;
+    occ[colorOf(p)] &= b;
+    occAll &= b;
+    sq[s] = EMPTY;
+}
+
 void Board::put(int s, int piece) {
-    if (sq[s]) pieceCount--;
-    sq[s] = piece;
+    checkCache = -1;
+    if (sq[s]) {
+        removePiece(s);
+        pieceCount--;
+    }
     if (piece) {
+        addPiece(s, piece);
         pieceCount++;
         if (typeOf(piece) == KING) kingSq[colorOf(piece)] = s;
     }
@@ -154,6 +205,7 @@ bool Board::setFEN(const std::string& fen) {
     if (kings[0] != 1 || kings[1] != 1) return false;
     if (side != "w" && side != "b") return false;
     stm = side == "b" ? BLACK : WHITE;
+    checkCache = -1;
 
     for (char c : cas) {
         if (c == 'K' && sq[4] == makePiece(WHITE, KING) && sq[7] == makePiece(WHITE, ROOK)) castle |= 1;
@@ -200,118 +252,105 @@ std::string Board::getFEN() const {
     return s;
 }
 
+Bitboard Board::attackersTo(int s, Bitboard o) const {
+    Bitboard bq = pieces[0][BISHOP] | pieces[1][BISHOP] | pieces[0][QUEEN] | pieces[1][QUEEN];
+    Bitboard rq = pieces[0][ROOK] | pieces[1][ROOK] | pieces[0][QUEEN] | pieces[1][QUEEN];
+    return (PAWN_ATT[BLACK][s] & pieces[WHITE][PAWN]) | (PAWN_ATT[WHITE][s] & pieces[BLACK][PAWN]) |
+           (KNIGHT_ATT[s] & (pieces[0][KNIGHT] | pieces[1][KNIGHT])) |
+           (KING_ATT[s] & (pieces[0][KING] | pieces[1][KING])) | (attacks::bishop(s, o) & bq) |
+           (attacks::rook(s, o) & rq);
+}
+
 bool Board::attacked(int s, int by) const {
-    int f = fileOf(s), r = rankOf(s);
-    if (by == WHITE) {
-        if (r > 0) {
-            if (f > 0 && sq[s - 9] == WP) return true;
-            if (f < 7 && sq[s - 7] == WP) return true;
-        }
-    } else {
-        if (r < 7) {
-            if (f > 0 && sq[s + 7] == BP) return true;
-            if (f < 7 && sq[s + 9] == BP) return true;
-        }
-    }
-    int kn = makePiece(by, KNIGHT);
-    for (int i = 0; i < knightN[s]; i++)
-        if (sq[knightTo[s][i]] == kn) return true;
-    int kg = makePiece(by, KING);
-    for (int i = 0; i < kingN[s]; i++)
-        if (sq[kingTo[s][i]] == kg) return true;
-    int R = makePiece(by, ROOK), B = makePiece(by, BISHOP), Q = makePiece(by, QUEEN);
-    for (int d = 0; d < 4; d++)
-        for (int i = 0; i < rayN[s][d]; i++) {
-            int p = sq[rays[s][d][i]];
-            if (p) {
-                if (p == R || p == Q) return true;
-                break;
-            }
-        }
-    for (int d = 4; d < 8; d++)
-        for (int i = 0; i < rayN[s][d]; i++) {
-            int p = sq[rays[s][d][i]];
-            if (p) {
-                if (p == B || p == Q) return true;
-                break;
-            }
-        }
+    if (PAWN_ATT[by ^ 1][s] & pieces[by][PAWN]) return true;
+    if (KNIGHT_ATT[s] & pieces[by][KNIGHT]) return true;
+    if (KING_ATT[s] & pieces[by][KING]) return true;
+    Bitboard bq = pieces[by][BISHOP] | pieces[by][QUEEN];
+    if (bq && (attacks::bishop(s, occAll) & bq)) return true;
+    Bitboard rq = pieces[by][ROOK] | pieces[by][QUEEN];
+    if (rq && (attacks::rook(s, occAll) & rq)) return true;
     return false;
 }
 
 void Board::genMoves(MoveList& ml, bool capturesOnly) const {
     ml.count = 0;
     const int us = stm, them = stm ^ 1;
-    for (int s = 0; s < 64; s++) {
-        int p = sq[s];
-        if (!p || colorOf(p) != us) continue;
-        int t = typeOf(p);
-        if (t == PAWN) {
-            int dir = us == WHITE ? 8 : -8;
-            int startRank = us == WHITE ? 1 : 6;
-            int promoRank = us == WHITE ? 7 : 0;
-            int to = s + dir;
-            auto addPawn = [&](int from, int dest, uint32_t flags) {
-                if (rankOf(dest) == promoRank) {
-                    for (int pr : {QUEEN, KNIGHT, ROOK, BISHOP}) ml.add(encodeMove(from, dest, pr, flags));
-                } else {
-                    ml.add(encodeMove(from, dest, 0, flags));
-                }
-            };
-            if (sq[to] == EMPTY) {
-                if (!capturesOnly || rankOf(to) == promoRank) addPawn(s, to, 0);
-                if (!capturesOnly && rankOf(s) == startRank && sq[to + dir] == EMPTY)
-                    ml.add(encodeMove(s, to + dir, 0, MF_DOUBLE));
+    const Bitboard enemies = occ[them], empty = ~occAll;
+
+    // Pawns
+    const int up = us == WHITE ? 8 : -8;
+    const Bitboard promoRank = rankMask(us == WHITE ? 7 : 0);
+    const Bitboard thirdRank = rankMask(us == WHITE ? 2 : 5);
+    Bitboard pawns = pieces[us][PAWN];
+    auto shift = [&](Bitboard b) { return us == WHITE ? b << 8 : b >> 8; };
+    Bitboard push1 = shift(pawns) & empty;
+    Bitboard push2 = shift(push1 & thirdRank) & empty;
+    auto addPromos = [&](int from, int to, uint32_t flags) {
+        for (int pr : {QUEEN, KNIGHT, ROOK, BISHOP}) ml.add(encodeMove(from, to, pr, flags));
+    };
+    for (Bitboard b = push1 & promoRank; b;) {
+        int to = popLsb(b);
+        addPromos(to - up, to, 0);
+    }
+    if (!capturesOnly) {
+        for (Bitboard b = push1 & ~promoRank; b;) {
+            int to = popLsb(b);
+            ml.add(encodeMove(to - up, to));
+        }
+        for (Bitboard b = push2; b;) {
+            int to = popLsb(b);
+            ml.add(encodeMove(to - 2 * up, to, 0, MF_DOUBLE));
+        }
+    }
+    for (Bitboard b = pawns; b;) {
+        int from = popLsb(b);
+        Bitboard att = PAWN_ATT[us][from];
+        for (Bitboard c = att & enemies; c;) {
+            int to = popLsb(c);
+            if (bit(to) & promoRank)
+                addPromos(from, to, MF_CAPTURE);
+            else
+                ml.add(encodeMove(from, to, 0, MF_CAPTURE));
+        }
+        if (ep >= 0 && (att & bit(ep))) ml.add(encodeMove(from, ep, 0, MF_CAPTURE | MF_EP));
+    }
+
+    // Pieces
+    const Bitboard targets = capturesOnly ? enemies : ~occ[us];
+    for (int t = KNIGHT; t <= KING; t++) {
+        for (Bitboard b = pieces[us][t]; b;) {
+            int from = popLsb(b);
+            Bitboard a;
+            switch (t) {
+                case KNIGHT: a = KNIGHT_ATT[from]; break;
+                case BISHOP: a = attacks::bishop(from, occAll); break;
+                case ROOK: a = attacks::rook(from, occAll); break;
+                case QUEEN: a = attacks::queen(from, occAll); break;
+                default: a = KING_ATT[from]; break;
             }
-            for (int df : {-1, 1}) {
-                int nf = fileOf(s) + df;
-                if (nf < 0 || nf > 7) continue;
-                int c = to + df;
-                if (sq[c] && colorOf(sq[c]) == them)
-                    addPawn(s, c, MF_CAPTURE);
-                else if (c == ep)
-                    ml.add(encodeMove(s, c, 0, MF_CAPTURE | MF_EP));
+            for (a &= targets; a;) {
+                int to = popLsb(a);
+                ml.add(encodeMove(from, to, 0, (bit(to) & enemies) ? MF_CAPTURE : 0));
             }
-        } else if (t == KNIGHT || t == KING) {
-            const int* tgt = t == KNIGHT ? knightTo[s] : kingTo[s];
-            int n = t == KNIGHT ? knightN[s] : kingN[s];
-            for (int i = 0; i < n; i++) {
-                int to = tgt[i];
-                if (!sq[to]) {
-                    if (!capturesOnly) ml.add(encodeMove(s, to));
-                } else if (colorOf(sq[to]) == them) {
-                    ml.add(encodeMove(s, to, 0, MF_CAPTURE));
-                }
-            }
-            if (t == KING && !capturesOnly && castle) {
-                if (us == WHITE && s == 4) {
-                    if ((castle & 1) && !sq[5] && !sq[6] && !attacked(4, BLACK) && !attacked(5, BLACK) &&
-                        !attacked(6, BLACK))
-                        ml.add(encodeMove(4, 6, 0, MF_CASTLE));
-                    if ((castle & 2) && !sq[3] && !sq[2] && !sq[1] && !attacked(4, BLACK) &&
-                        !attacked(3, BLACK) && !attacked(2, BLACK))
-                        ml.add(encodeMove(4, 2, 0, MF_CASTLE));
-                } else if (us == BLACK && s == 60) {
-                    if ((castle & 4) && !sq[61] && !sq[62] && !attacked(60, WHITE) && !attacked(61, WHITE) &&
-                        !attacked(62, WHITE))
-                        ml.add(encodeMove(60, 62, 0, MF_CASTLE));
-                    if ((castle & 8) && !sq[59] && !sq[58] && !sq[57] && !attacked(60, WHITE) &&
-                        !attacked(59, WHITE) && !attacked(58, WHITE))
-                        ml.add(encodeMove(60, 58, 0, MF_CASTLE));
-                }
-            }
-        } else {
-            int d0 = t == BISHOP ? 4 : 0, d1 = t == ROOK ? 4 : 8;
-            for (int d = d0; d < d1; d++)
-                for (int i = 0; i < rayN[s][d]; i++) {
-                    int to = rays[s][d][i];
-                    if (!sq[to]) {
-                        if (!capturesOnly) ml.add(encodeMove(s, to));
-                        continue;
-                    }
-                    if (colorOf(sq[to]) == them) ml.add(encodeMove(s, to, 0, MF_CAPTURE));
-                    break;
-                }
+        }
+    }
+
+    // Castling
+    if (!capturesOnly && castle) {
+        if (us == WHITE && kingSq[us] == 4) {
+            if ((castle & 1) && !(occAll & 0x60ULL) && !attacked(4, BLACK) && !attacked(5, BLACK) &&
+                !attacked(6, BLACK))
+                ml.add(encodeMove(4, 6, 0, MF_CASTLE));
+            if ((castle & 2) && !(occAll & 0x0EULL) && !attacked(4, BLACK) && !attacked(3, BLACK) &&
+                !attacked(2, BLACK))
+                ml.add(encodeMove(4, 2, 0, MF_CASTLE));
+        } else if (us == BLACK && kingSq[us] == 60) {
+            if ((castle & 4) && !(occAll & (0x60ULL << 56)) && !attacked(60, WHITE) && !attacked(61, WHITE) &&
+                !attacked(62, WHITE))
+                ml.add(encodeMove(60, 62, 0, MF_CASTLE));
+            if ((castle & 8) && !(occAll & (0x0EULL << 56)) && !attacked(60, WHITE) && !attacked(59, WHITE) &&
+                !attacked(58, WHITE))
+                ml.add(encodeMove(60, 58, 0, MF_CASTLE));
         }
     }
 }
@@ -342,28 +381,31 @@ bool Board::makeMove(Move m) {
     int p = sq[from];
     int capSq = (flags & MF_EP) ? to + (stm == WHITE ? -8 : 8) : to;
     int cap = sq[capSq];
+    // A move can only expose our king if we are in check, the king moves, it is en passant,
+    // or the moving piece sits on a line through our king (a potential pin).
+    bool mustTest = inCheck() || typeOf(p) == KING || (flags & MF_EP) || (LINES[kingSq[stm]] & bit(from));
 
-    undoStack.push_back({m, cap, castle, ep, halfmove, hash});
+    undoStack.push_back({m, cap, castle, ep, halfmove, hash, checkCache});
     hashHistory.push_back(hash);
 
     if (ep >= 0) hash ^= Z_ep[fileOf(ep)];
     if (cap) {
         hash ^= Z_piece[cap][capSq];
-        sq[capSq] = EMPTY;
+        removePiece(capSq);
         pieceCount--;
     }
     hash ^= Z_piece[p][from];
-    sq[from] = EMPTY;
+    removePiece(from);
     int np = movePromo(m) ? makePiece(stm, movePromo(m)) : p;
-    sq[to] = np;
+    addPiece(to, np);
     hash ^= Z_piece[np][to];
     if (typeOf(p) == KING) kingSq[stm] = to;
     if (flags & MF_CASTLE) {
         int rf, rt;
         rookCastleSquares(to, rf, rt);
         int rook = sq[rf];
-        sq[rf] = EMPTY;
-        sq[rt] = rook;
+        removePiece(rf);
+        addPiece(rt, rook);
         hash ^= Z_piece[rook][rf] ^ Z_piece[rook][rt];
     }
     hash ^= Z_castle[castle];
@@ -378,8 +420,9 @@ bool Board::makeMove(Move m) {
     if (stm == BLACK) fullmove++;
     stm = Color(stm ^ 1);
     hash ^= Z_side;
+    checkCache = -1;
 
-    if (attacked(kingSq[stm ^ 1], stm)) {
+    if (mustTest && attacked(kingSq[stm ^ 1], stm)) {
         unmakeMove();
         return false;
     }
@@ -396,28 +439,31 @@ void Board::unmakeMove() {
     int from = moveFrom(m), to = moveTo(m);
     uint32_t flags = moveFlags(m);
     int p = movePromo(m) ? makePiece(stm, PAWN) : sq[to];
-    sq[from] = p;
-    sq[to] = EMPTY;
+    removePiece(to);
+    addPiece(from, p);
     if (typeOf(p) == KING) kingSq[stm] = from;
     if (flags & MF_CASTLE) {
         int rf, rt;
         rookCastleSquares(to, rf, rt);
-        sq[rf] = sq[rt];
-        sq[rt] = EMPTY;
+        int rook = sq[rt];
+        removePiece(rt);
+        addPiece(rf, rook);
     }
     if (u.captured) {
         int capSq = (flags & MF_EP) ? to + (stm == WHITE ? -8 : 8) : to;
-        sq[capSq] = u.captured;
+        addPiece(capSq, u.captured);
         pieceCount++;
     }
     castle = u.castle;
     ep = u.ep;
     halfmove = u.halfmove;
     hash = u.hash;
+    checkCache = u.checkCache;
 }
 
 void Board::makeNull() {
-    undoStack.push_back({NO_MOVE, 0, castle, ep, halfmove, hash});
+    undoStack.push_back({NO_MOVE, 0, castle, ep, halfmove, hash, checkCache});
+    checkCache = -1;
     hashHistory.push_back(hash);
     if (ep >= 0) hash ^= Z_ep[fileOf(ep)];
     ep = -1;
@@ -434,6 +480,7 @@ void Board::unmakeNull() {
     ep = u.ep;
     halfmove = u.halfmove;
     hash = u.hash;
+    checkCache = u.checkCache;
 }
 
 bool Board::isRepetition() const {
@@ -454,23 +501,17 @@ int Board::repetitionCount() const {
 }
 
 bool Board::insufficientMaterial() const {
-    int minors = 0, bishopColors = 0, knights = 0;
-    for (int s = 0; s < 64; s++) {
-        int t = typeOf(sq[s]);
-        if (t == PAWN || t == ROOK || t == QUEEN) return false;
-        if (t == KNIGHT) minors++, knights++;
-        if (t == BISHOP) minors++, bishopColors |= 1 << ((fileOf(s) + rankOf(s)) & 1);
-    }
-    if (minors <= 1) return true;
-    return knights == 0 && bishopColors != 3;  // only same-colored bishops
+    for (int c = 0; c < 2; c++)
+        if (pieces[c][PAWN] | pieces[c][ROOK] | pieces[c][QUEEN]) return false;
+    Bitboard knights = pieces[0][KNIGHT] | pieces[1][KNIGHT];
+    Bitboard bishops = pieces[0][BISHOP] | pieces[1][BISHOP];
+    if (popcount(knights | bishops) <= 1) return true;
+    const Bitboard DARK = 0xAA55AA55AA55AA55ULL;
+    return !knights && (!(bishops & DARK) || !(bishops & ~DARK));  // only same-colored bishops
 }
 
 bool Board::hasNonPawnMaterial(int c) const {
-    for (int s = 0; s < 64; s++) {
-        int p = sq[s];
-        if (p && colorOf(p) == c && typeOf(p) != PAWN && typeOf(p) != KING) return true;
-    }
-    return false;
+    return (pieces[c][KNIGHT] | pieces[c][BISHOP] | pieces[c][ROOK] | pieces[c][QUEEN]) != 0;
 }
 
 std::string Board::moveToUCI(Move m) const {
@@ -484,6 +525,50 @@ Move Board::parseUCI(const std::string& str) {
     genLegal(ml);
     for (int i = 0; i < ml.count; i++)
         if (moveToUCI(ml.moves[i]) == str) return ml.moves[i];
+    return NO_MOVE;
+}
+
+// Parses standard algebraic notation ("Nbd7", "exd5", "e8=Q+", "O-O") against the legal moves.
+Move Board::parseSAN(const std::string& in) {
+    std::string s;
+    for (char c : in)
+        if (c != '+' && c != '#' && c != '!' && c != '?' && c != 'x' && c != '=') s += c;
+    MoveList ml;
+    genLegal(ml);
+    if (s == "O-O" || s == "0-0" || s == "O-O-O" || s == "0-0-0") {
+        bool longSide = s.size() == 5;
+        for (int i = 0; i < ml.count; i++) {
+            Move m = ml.moves[i];
+            if ((moveFlags(m) & MF_CASTLE) && (fileOf(moveTo(m)) == 2) == longSide) return m;
+        }
+        return NO_MOVE;
+    }
+    if (s.size() < 2) return NO_MOVE;
+    int type = PAWN;
+    size_t i = 0;
+    if (std::strchr("NBRQK", s[0])) type = int(std::string(" PNBRQK").find(s[0])), i = 1;
+    int promo = 0;
+    if (std::strchr("NBRQ", s.back())) {
+        promo = int(std::string(" PNBRQK").find(s.back()));
+        s.pop_back();
+    }
+    if (s.size() < i + 2) return NO_MOVE;
+    int to = (s[s.size() - 1] - '1') * 8 + (s[s.size() - 2] - 'a');
+    std::string dis = s.substr(i, s.size() - 2 - i);
+    int disFile = -1, disRank = -1;
+    for (char c : dis) {
+        if (c >= 'a' && c <= 'h') disFile = c - 'a';
+        if (c >= '1' && c <= '8') disRank = c - '1';
+    }
+    for (int k = 0; k < ml.count; k++) {
+        Move m = ml.moves[k];
+        int from = moveFrom(m);
+        if (moveTo(m) != to || typeOf(sq[from]) != type || movePromo(m) != promo) continue;
+        if (moveFlags(m) & MF_CASTLE) continue;
+        if (disFile >= 0 && fileOf(from) != disFile) continue;
+        if (disRank >= 0 && rankOf(from) != disRank) continue;
+        return m;
+    }
     return NO_MOVE;
 }
 

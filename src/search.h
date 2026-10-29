@@ -22,6 +22,8 @@ struct SearchInfo {
 using InfoFn = std::function<void(const SearchInfo&)>;
 
 // Iterative-deepening alpha-beta search. Stops after timeMs or when *stop becomes true.
-Move findBestMove(const Board& root, int timeMs, std::atomic<bool>* stop, const InfoFn& info);
+Move findBestMove(const Board& root, int timeMs, std::atomic<bool>* stop, const InfoFn& info, bool useBook = false);
+// Quiescence search score (side to move's view), used to filter tuning positions.
+int quiescenceScore(const Board& pos);
 void clearSearchMemory();
 std::string scoreToString(int score);  // "+0.35", "M4", "-M2"

@@ -140,6 +140,7 @@ void setup(Board& b, const Table& T, const int* s, int stm) {
     b.clear();
     for (int i = 0; i < T.n; i++) b.put(s[i], T.piece[i]);
     b.stm = Color(stm);
+    b.checkCache = -1;
 }
 
 // Index of the board's position in table T. If flip, colors are swapped and ranks mirrored.
