@@ -27,12 +27,16 @@ On first launch the endgame tables are generated in the background (~5 min, ~260
 ## Engine
 
 - **Board** (`board.cpp`): bitboards with classical ray attacks, incremental Zobrist hashing, full rules. The legality check is skipped for moves that cannot expose the king.
-- **Search** (`search.cpp`): iterative-deepening negamax with alpha-beta pruning and a principal variation search (PVS) window. It also uses:
-  - a transposition table;
-  - null-move pruning, reverse futility pruning and late move reductions;
-  - check extensions;
-  - move ordering by MVV-LVA with static exchange evaluation (SEE), killer moves and the history heuristic;
-  - quiescence search that drops SEE-losing captures and uses delta pruning.
+- **Search** (`search.cpp`): iterative-deepening negamax with alpha-beta pruning, a principal variation search (PVS) window and aspiration windows.
+  - **Pruning:**
+    - null-move pruning and reverse futility pruning, both adjusted by an "improving" signal;
+    - futility pruning and late-move pruning;
+    - SEE pruning of losing moves at low depth;
+    - log-scaled late move reductions.
+  - **Extensions:** check extensions and singular extensions (with multi-cut), plus internal iterative reduction when there is no remembered best move.
+  - **Move ordering:** MVV-LVA with SEE, killer moves, counter-moves, and a history table that also penalizes moves that failed.
+  - **Quiescence search:** drops SEE-losing captures, uses delta pruning and probes the transposition table.
+- **Multi-threading:** Lazy SMP. All threads search the same position and share a lockless transposition table. The GUI defaults to 4 threads (Engine menu: 1/2/4/8); UCI has a `Threads` option.
 - **Evaluation** (`eval.cpp`): a tapered (middlegame/endgame) linear evaluation with about 560 weights. Its terms are:
   - material and piece-square tables;
   - mobility, measured as safe squares per piece;
@@ -49,6 +53,8 @@ On first launch the endgame tables are generated in the background (~5 min, ~260
 |---|---|---|
 | v2: bitboards + mobility/king safety + SEE pruning, vs v1 | +55 -16 =29 | about +143 |
 | v3: Texel-tuned weights, vs v2 | +57 -48 =15 | about +26 |
+| v4: search improvements (single thread), vs v3 | +158 -2 =40 | about +363 |
+| v4 with 4 threads, vs v4 with 1 thread | +43 -5 =32 | about +179 |
 
 ## Tools
 
@@ -59,7 +65,7 @@ chesscli uci                                     # UCI engine (Arena, Cute Chess
 chesscli mkbook book.bin 20 games.pgn...
 chesscli extract data/positions.txt 3 1500000 games.pgn...
 chesscli tune data/positions.txt src/eval_weights.inc 400
-python tools/match.py "engines/new.exe uci" "engines/old.exe uci" --games 100 --tc 8+0.08
+python tools/match.py "engines/new.exe uci" "engines/old.exe uci" --games 100 --tc 8+0.08 [--threads-a 4]
 ```
 
 ## Credits

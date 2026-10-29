@@ -22,7 +22,9 @@ struct SearchInfo {
 using InfoFn = std::function<void(const SearchInfo&)>;
 
 // Iterative-deepening alpha-beta search. Stops after timeMs or when *stop becomes true.
-Move findBestMove(const Board& root, int timeMs, std::atomic<bool>* stop, const InfoFn& info, bool useBook = false);
+// Uses `threads` search threads (Lazy SMP: all threads search the same tree and share the TT).
+Move findBestMove(const Board& root, int timeMs, std::atomic<bool>* stop, const InfoFn& info, bool useBook = false,
+                  int threads = 1);
 // Quiescence search score (side to move's view), used to filter tuning positions.
 int quiescenceScore(const Board& pos);
 void clearSearchMemory();

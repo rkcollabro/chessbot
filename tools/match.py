@@ -26,6 +26,9 @@ OPENINGS = [
 ]
 
 
+THREADS = {}  # engine command -> thread count
+
+
 def command(cmd):
     parts = shlex.split(cmd, posix=False)
     parts[0] = os.path.abspath(parts[0])
@@ -44,6 +47,10 @@ def play(cmd_white, cmd_black, opening, tc):
         for e in engines.values():
             if "OwnBook" in e.options:
                 e.configure({"OwnBook": False})  # the match supplies its own openings
+        for side, cmd in ((chess.WHITE, cmd_white), (chess.BLACK, cmd_black)):
+            t = THREADS.get(cmd)
+            if t and "Threads" in engines[side].options:
+                engines[side].configure({"Threads": t})
         clock = {chess.WHITE: base, chess.BLACK: base}
         while not board.is_game_over(claim_draw=True):
             side = board.turn
@@ -76,8 +83,14 @@ def main():
     ap.add_argument("--games", type=int, default=60)
     ap.add_argument("--tc", default="10+0.1", help="seconds per game + increment")
     ap.add_argument("--concurrency", type=int, default=4)
+    ap.add_argument("--threads-a", type=int, default=0)
+    ap.add_argument("--threads-b", type=int, default=0)
     args = ap.parse_args()
     base, inc = (float(x) for x in args.tc.split("+"))
+    if args.a == args.b and (args.threads_a or args.threads_b):
+        args.b += " "  # distinguish identical commands so each side gets its own thread count
+    THREADS[args.a] = args.threads_a
+    THREADS[args.b] = args.threads_b
 
     openings = OPENINGS[:]
     random.Random(1).shuffle(openings)

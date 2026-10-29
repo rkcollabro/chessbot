@@ -30,8 +30,10 @@ enum {
     ID_NEW_WHITE = 101, ID_NEW_BLACK, ID_UNDO, ID_FLIP, ID_COPY_FEN, ID_PASTE_FEN, ID_EXIT,
     ID_SWITCH_SIDES = 201, ID_MOVE_NOW,
     ID_TIME_BASE = 300,  // + index into THINK_TIMES
+    ID_THREADS_BASE = 400,  // + index into THREAD_COUNTS
 };
 const int THINK_TIMES[] = {1000, 3000, 5000, 10000, 30000};
+const int THREAD_COUNTS[] = {1, 2, 4, 8};
 
 const COLORREF C_BG = RGB(38, 36, 33);
 const COLORREF C_PANEL_TEXT = RGB(222, 220, 214);
@@ -56,6 +58,7 @@ struct App {
     int selected = -1;
     std::vector<Move> targets;
     int thinkIndex = 1;
+    int threadIndex = 2;  // 4 threads
     std::string gameOver;
 
     std::thread engine;
@@ -211,6 +214,7 @@ void startEngine() {
     unsigned gen = ++g.engineGen;
     Board copy = g.board;
     int ms = THINK_TIMES[g.thinkIndex];
+    int threads = THREAD_COUNTS[g.threadIndex];
     bool engineWhite = g.board.stm == WHITE;
     HWND hwnd = g.hwnd;
     {
@@ -237,7 +241,7 @@ void startEngine() {
             g.pvLine = si.pv;
             g.tbNote = si.note;
             PostMessage(hwnd, WM_REFRESH, 0, 0);
-        }, true);
+        }, true, threads);
         PostMessage(hwnd, WM_ENGINE_DONE, gen, LPARAM(m));
     });
 }
@@ -500,7 +504,8 @@ void paintPanel(HDC dc, const Layout& L) {
     line(title, "ChessBot", C_PANEL_TEXT, S(36));
     std::string sides = std::string("You: ") + (g.human == WHITE ? "White" : "Black") +
                         "    Engine: " + (g.human == WHITE ? "Black" : "White") + "    (" +
-                        std::to_string(THINK_TIMES[g.thinkIndex] / 1000) + "s/move)";
+                        std::to_string(THINK_TIMES[g.thinkIndex] / 1000) + "s, " +
+                        std::to_string(THREAD_COUNTS[g.threadIndex]) + " threads)";
     line(normal, sides, C_DIM_TEXT, S(24));
     y += S(10);
 
@@ -578,6 +583,7 @@ void updateTimeMenu() {
     HMENU menu = GetMenu(g.hwnd);
     int n = int(sizeof(THINK_TIMES) / sizeof(THINK_TIMES[0]));
     CheckMenuRadioItem(menu, ID_TIME_BASE, ID_TIME_BASE + n - 1, ID_TIME_BASE + g.thinkIndex, MF_BYCOMMAND);
+    CheckMenuRadioItem(menu, ID_THREADS_BASE, ID_THREADS_BASE + 3, ID_THREADS_BASE + g.threadIndex, MF_BYCOMMAND);
 }
 
 HMENU buildMenu() {
@@ -602,6 +608,9 @@ HMENU buildMenu() {
     const wchar_t* labels[] = {L"Think 1 second", L"Think 3 seconds", L"Think 5 seconds", L"Think 10 seconds",
                                L"Think 30 seconds"};
     for (int i = 0; i < 5; i++) AppendMenuW(eng, MF_STRING, ID_TIME_BASE + i, labels[i]);
+    AppendMenuW(eng, MF_SEPARATOR, 0, nullptr);
+    const wchar_t* threadLabels[] = {L"1 thread", L"2 threads", L"4 threads", L"8 threads"};
+    for (int i = 0; i < 4; i++) AppendMenuW(eng, MF_STRING, ID_THREADS_BASE + i, threadLabels[i]);
     AppendMenuW(bar, MF_POPUP, UINT_PTR(eng), L"&Engine");
     return bar;
 }
@@ -626,6 +635,11 @@ void onCommand(int id) {
             break;
         case ID_MOVE_NOW: g.engineStop = true; break;
         default:
+            if (id >= ID_THREADS_BASE && id < ID_THREADS_BASE + 4) {
+                g.threadIndex = id - ID_THREADS_BASE;
+                updateTimeMenu();
+                InvalidateRect(g.hwnd, nullptr, FALSE);
+            }
             if (id >= ID_TIME_BASE && id < ID_TIME_BASE + 5) {
                 g.thinkIndex = id - ID_TIME_BASE;
                 updateTimeMenu();

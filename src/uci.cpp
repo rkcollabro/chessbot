@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstdio>
 #include <iostream>
 #include <sstream>
@@ -39,6 +40,7 @@ void uciLoop(const std::string& tbDir, const std::string& bookPath) {
     tb::init(tbDir);
     book::load(bookPath);
     bool ownBook = true;
+    int threads = 1;
     std::thread([] { tb::loadOrGenerateAll(nullptr); }).detach();
 
     Board board;
@@ -58,7 +60,17 @@ void uciLoop(const std::string& tbDir, const std::string& bookPath) {
         std::string cmd;
         in >> cmd;
         if (cmd == "uci") {
-            std::printf("id name ChessBot\nid author Randy\nuciok\n");
+            std::printf("id name ChessBot\nid author Randy\n");
+            std::printf("option name OwnBook type check default true\n");
+            std::printf("option name Threads type spin default 1 min 1 max 64\n");
+            std::printf("uciok\n");
+        } else if (cmd == "setoption") {
+            std::string tok, name, value;
+            in >> tok >> name;  // "name" <name>
+            while (in >> tok && tok != "value") name += " " + tok;
+            in >> value;
+            if (name == "OwnBook") ownBook = value == "true";
+            if (name == "Threads") threads = std::max(1, std::atoi(value.c_str()));
         } else if (cmd == "isready") {
             std::printf("readyok\n");
         } else if (cmd == "ucinewgame") {
@@ -96,7 +108,7 @@ void uciLoop(const std::string& tbDir, const std::string& bookPath) {
             }
             stop = false;
             Board copy = board;
-            worker = std::thread([copy, ms, ownBook, &stop] {
+            worker = std::thread([copy, ms, ownBook, threads, &stop] {
                 Move m = findBestMove(copy, ms, &stop, [](const SearchInfo& si) {
                     std::printf("info depth %d score %s nodes %llu time %d\n", si.depth,
                                 si.score > MATE_BOUND    ? ("mate " + std::to_string((MATE - si.score + 1) / 2)).c_str()
@@ -104,7 +116,7 @@ void uciLoop(const std::string& tbDir, const std::string& bookPath) {
                                                          : ("cp " + std::to_string(si.score)).c_str(),
                                 (unsigned long long)si.nodes, si.ms);
                     std::fflush(stdout);
-                }, ownBook);
+                }, ownBook, threads);
                 std::printf("bestmove %s\n", m ? copy.moveToUCI(m).c_str() : "0000");
                 std::fflush(stdout);
             });
