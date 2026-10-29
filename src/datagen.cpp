@@ -20,6 +20,7 @@ namespace {
 struct Game {
     double result = -1;  // 1, 0.5, 0 from White's view; -1 unknown
     int whiteElo = 0, blackElo = 0;
+    int baseSeconds = -1;  // from the TimeControl tag, e.g. "180+2" -> 180
     std::vector<std::string> moves;
 };
 
@@ -45,6 +46,8 @@ bool readGame(std::istream& in, Game& g) {
             if (r == "1-0") g.result = 1;
             else if (r == "0-1") g.result = 0;
             else if (r == "1/2-1/2") g.result = 0.5;
+            std::string tc = val("TimeControl");
+            if (!tc.empty() && std::isdigit((unsigned char)tc[0])) g.baseSeconds = std::atoi(tc.c_str());
             std::string we = val("WhiteElo"), be = val("BlackElo");
             if (!we.empty()) g.whiteElo = std::atoi(we.c_str());
             if (!be.empty()) g.blackElo = std::atoi(be.c_str());
@@ -102,17 +105,26 @@ void forEachGame(const std::vector<std::string>& files, F&& fn) {
 
 // ---------------------------------------------------------------- opening book
 
-int buildBook(const std::string& out, int maxPly, const std::vector<std::string>& pgns) {
+// Pass 1 counts (position, move) pairs from qualifying games; pass 2 records a FEN for each kept
+// position. The result is a text file "fen;uci;weight;games;score" so the moves can be vetted
+// (tools/vet_book.py) before `booktxt` turns it into book.bin.
+int buildBook(const std::string& outTxt, int maxPly, int minElo, int minBaseSeconds,
+              const std::vector<std::string>& pgns) {
     struct Stat {
         uint64_t hash = 0;
         uint16_t move = 0;
         uint32_t games = 0;
         float score = 0;  // for the side making the move
     };
+    auto qualifies = [&](const Game& g) {
+        return g.result >= 0 && std::min(g.whiteElo, g.blackElo) >= minElo && g.baseSeconds >= minBaseSeconds;
+    };
     std::unordered_map<uint64_t, Stat> stats;  // keyed by a mix of position hash and move
     stats.reserve(1 << 22);
+    long long used = 0;
     forEachGame(pgns, [&](const Game& g) {
-        if (g.result < 0 || std::min(g.whiteElo, g.blackElo) < 2300) return true;
+        if (!qualifies(g)) return true;
+        used++;
         Board b;
         b.setStartPos();
         for (int ply = 0; ply < maxPly && ply < int(g.moves.size()); ply++) {
@@ -129,21 +141,70 @@ int buildBook(const std::string& out, int maxPly, const std::vector<std::string>
         return true;
     });
 
-    std::vector<book::Entry> entries;
+    std::vector<Stat> kept;
+    std::unordered_map<uint64_t, std::string> fens;  // positions that have at least one kept move
     for (auto& kv : stats) {
         const Stat& s = kv.second;
-        if (s.games < 25) continue;  // too rare to trust
+        if (s.games < 20) continue;  // too rare to trust
+        if (s.score / s.games < 0.40) continue;  // moves that score badly for the mover
+        kept.push_back(s);
+        fens.emplace(s.hash, "");
+    }
+    stats.clear();
+
+    forEachGame(pgns, [&](const Game& g) {
+        if (!qualifies(g)) return true;
+        Board b;
+        b.setStartPos();
+        for (int ply = 0; ply < maxPly && ply < int(g.moves.size()); ply++) {
+            auto it = fens.find(b.hash);
+            if (it == fens.end()) break;  // left the book tree
+            if (it->second.empty()) it->second = b.getFEN();
+            Move m = b.parseSAN(g.moves[ply]);
+            if (!m) break;
+            b.makeMove(m);
+        }
+        return true;
+    });
+
+    std::ofstream f(outTxt);
+    for (const Stat& s : kept) {
+        const std::string& fen = fens[s.hash];
+        if (fen.empty()) continue;
+        Board b;
+        b.setFEN(fen);
         double pct = s.score / s.games;
-        if (pct < 0.42) continue;  // moves that score badly for the mover
-        double w = s.games * pct * pct;
-        entries.push_back({s.hash, s.move, uint16_t(std::min(65535.0, std::sqrt(w) * 10))});
+        int weight = int(std::min(65535.0, std::sqrt(s.games * pct * pct) * 10));
+        f << fen << ';' << b.moveToUCI(Move(s.move)) << ';' << weight << ';' << s.games << ';' << pct << '\n';
+    }
+    std::printf("book: %lld qualifying games, %zu moves in %zu positions written to %s\n", used, kept.size(),
+                fens.size(), outTxt.c_str());
+    return 0;
+}
+
+// Converts vetted "fen;uci;weight;..." lines into the binary book format.
+int bookFromText(const std::string& txt, const std::string& outBin) {
+    std::ifstream in(txt);
+    if (!in) return std::printf("cannot open %s\n", txt.c_str()), 1;
+    std::vector<book::Entry> entries;
+    std::string line;
+    while (std::getline(in, line)) {
+        std::vector<std::string> parts;
+        std::stringstream ss(line);
+        for (std::string p; std::getline(ss, p, ';');) parts.push_back(p);
+        if (parts.size() < 3) continue;
+        Board b;
+        if (!b.setFEN(parts[0])) continue;
+        Move m = b.parseUCI(parts[1]);
+        if (!m) continue;
+        entries.push_back({b.hash, uint16_t(m & 0x7FFF), uint16_t(std::atoi(parts[2].c_str()))});
     }
     std::sort(entries.begin(), entries.end(), [](const book::Entry& a, const book::Entry& b) {
         return a.key != b.key ? a.key < b.key : a.weight > b.weight;
     });
-    std::ofstream f(out, std::ios::binary);
+    std::ofstream f(outBin, std::ios::binary);
     f.write(reinterpret_cast<const char*>(entries.data()), entries.size() * sizeof(book::Entry));
-    std::printf("book: %zu entries written to %s\n", entries.size(), out.c_str());
+    std::printf("book: %zu entries written to %s\n", entries.size(), outBin.c_str());
     return 0;
 }
 

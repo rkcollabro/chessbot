@@ -44,7 +44,7 @@ On first launch the endgame tables are generated in the background (~5 min, ~260
   - passed, isolated and doubled pawns;
   - bishop pair, rooks on open files and pawn threats.
 - **Tuning** (`datagen.cpp`): Texel tuning, which fits the weights to game results with Adam on about 1.06M quiet positions from Lichess elite games. The weights live in `src/eval_weights.inc`.
-- **Opening book** (`book.bin`): about 29k positions from 2023 Lichess elite games where both players are rated 2300+, covering the first 20 plies. Moves are chosen at random, weighted by popularity and score.
+- **Opening book** (`book.bin`): 8,764 moves in about 6,000 positions, built from 2023 Lichess elite games between 2500+ players at 3 minutes or longer, covering the first 16 plies. Every move was vetted offline with Stockfish 19 at depth 16, and any move more than 0.4 pawns worse than the best was dropped. Moves are chosen at random, weighted by popularity and score.
 - **Tablebases** (`tablebase.cpp`): retrograde analysis over every material combination with 4 or fewer pieces (35 tables). The tables store distance to mate in plies. They are probed at every search node with 4 or fewer pieces, and at the root the engine plays the table's best move directly.
 
 ### Strength history (self-play, 8s + 0.08s per game)
@@ -55,6 +55,7 @@ On first launch the endgame tables are generated in the background (~5 min, ~260
 | v3: Texel-tuned weights, vs v2 | +57 -48 =15 | about +26 |
 | v4: search improvements (single thread), vs v3 | +158 -2 =40 | about +363 |
 | v4 with 4 threads, vs v4 with 1 thread | +43 -5 =32 | about +179 |
+| Experiment: pawn storms + quadratic king danger, vs v4 (not merged; branch `experiment/king-danger`) | +54 -73 =73 | about -33 |
 
 ## Tools
 
@@ -62,7 +63,9 @@ On first launch the endgame tables are generated in the background (~5 min, ~260
 chesscli test                                    # perft suite + hash consistency
 chesscli tbgen | tbprobe <fen> | search <ms> [fen]
 chesscli uci                                     # UCI engine (Arena, Cute Chess, lichess-bot, ...)
-chesscli mkbook book.bin 20 games.pgn...
+chesscli mkbook data/book_raw.txt 16 2500 180 games.pgn...   # plies, min Elo, min base seconds
+python tools/vet_book.py data/book_raw.txt data/book_vetted.txt  # needs Stockfish in tools/stockfish
+chesscli booktxt data/book_vetted.txt book.bin
 chesscli extract data/positions.txt 3 1500000 games.pgn...
 chesscli tune data/positions.txt src/eval_weights.inc 400
 python tools/match.py "engines/new.exe uci" "engines/old.exe uci" --games 100 --tc 8+0.08 [--threads-a 4]
