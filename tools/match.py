@@ -27,6 +27,7 @@ OPENINGS = [
 
 
 THREADS = {}  # engine command -> thread count
+BOOK = {}  # engine command -> use its own opening book
 
 
 def command(cmd):
@@ -35,7 +36,7 @@ def command(cmd):
     return parts
 
 
-def play(cmd_white, cmd_black, opening, tc):
+def play(cmd_white, cmd_black, opening, tc, movetime=0, adjudicate=False):
     base, inc = tc
     board = chess.Board()
     for uci in opening.split():
@@ -48,17 +49,33 @@ def play(cmd_white, cmd_black, opening, tc):
             if "OwnBook" in e.options:
                 e.configure({"OwnBook": False})  # the match supplies its own openings
         for side, cmd in ((chess.WHITE, cmd_white), (chess.BLACK, cmd_black)):
+            if BOOK.get(cmd) and "OwnBook" in engines[side].options:
+                engines[side].configure({"OwnBook": True})
+        for side, cmd in ((chess.WHITE, cmd_white), (chess.BLACK, cmd_black)):
             t = THREADS.get(cmd)
             if t and "Threads" in engines[side].options:
                 engines[side].configure({"Threads": t})
         clock = {chess.WHITE: base, chess.BLACK: base}
+        lopsided = 0  # consecutive plies where the mover's score is beyond +-1000 cp
         while not board.is_game_over(claim_draw=True):
             side = board.turn
-            limit = chess.engine.Limit(white_clock=clock[chess.WHITE], black_clock=clock[chess.BLACK],
-                                       white_inc=inc, black_inc=inc)
+            if movetime:
+                limit = chess.engine.Limit(time=movetime)
+            else:
+                limit = chess.engine.Limit(white_clock=clock[chess.WHITE], black_clock=clock[chess.BLACK],
+                                           white_inc=inc, black_inc=inc)
             t0 = time.monotonic()
-            result = engines[side].play(board, limit)
-            clock[side] -= time.monotonic() - t0
+            result = engines[side].play(board, limit, info=chess.engine.INFO_SCORE)
+            if not movetime:
+                clock[side] -= time.monotonic() - t0
+            if adjudicate and "score" in result.info:
+                cp = result.info["score"].pov(side).score(mate_score=100000)
+                if abs(cp) >= 1000 and board.ply() > 0:
+                    lopsided += 1
+                    if lopsided >= 6:  # both engines agree for three moves each: call the game
+                        return ("1-0" if (cp > 0) == (side == chess.WHITE) else "0-1")
+                else:
+                    lopsided = 0
             if clock[side] < -0.5 or result.move is None or result.move not in board.legal_moves:
                 return "0-1" if side == chess.WHITE else "1-0"  # flag or illegal move loses
             clock[side] += inc
@@ -85,25 +102,33 @@ def main():
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--threads-a", type=int, default=0)
     ap.add_argument("--threads-b", type=int, default=0)
+    ap.add_argument("--movetime", type=float, default=0, help="fixed seconds per move (overrides --tc)")
+    ap.add_argument("--book-a", action="store_true", help="let engine A use its own opening book")
+    ap.add_argument("--book-b", action="store_true", help="let engine B use its own opening book")
+    ap.add_argument("--startpos", action="store_true", help="start every game from the initial position")
+    ap.add_argument("--adjudicate", action="store_true", help="end games both engines score beyond +-10 pawns")
     args = ap.parse_args()
     base, inc = (float(x) for x in args.tc.split("+"))
-    if args.a == args.b and (args.threads_a or args.threads_b):
+    if args.a == args.b and (args.threads_a or args.threads_b or args.book_a or args.book_b):
         args.b += " "  # distinguish identical commands so each side gets its own thread count
     THREADS[args.a] = args.threads_a
     THREADS[args.b] = args.threads_b
+    BOOK[args.a] = args.book_a
+    BOOK[args.b] = args.book_b
 
     openings = OPENINGS[:]
     random.Random(1).shuffle(openings)
     jobs = []
     for i in range(args.games):
-        opening = openings[(i // 2) % len(openings)]
+        opening = "" if args.startpos else openings[(i // 2) % len(openings)]
         a_white = i % 2 == 0
         jobs.append((a_white, opening))
 
     score = wins = losses = draws = 0
     with cf.ThreadPoolExecutor(args.concurrency) as pool:
         futures = {
-            pool.submit(play, args.a if aw else args.b, args.b if aw else args.a, op, (base, inc)): aw
+            pool.submit(play, args.a if aw else args.b, args.b if aw else args.a, op, (base, inc),
+                        args.movetime, args.adjudicate): aw
             for aw, op in jobs
         }
         for n, f in enumerate(cf.as_completed(futures), 1):
