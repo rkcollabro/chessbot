@@ -5,7 +5,8 @@
 //   chesscli tbprobe <fen>
 //   chesscli search <ms> [fen]
 //   chesscli uci                  UCI protocol on stdin/stdout
-//   chesscli mkbook <out.bin> <maxply> <pgn>...
+//   chesscli mkbook <out.txt> <maxply> <minElo> <minBaseSeconds> <pgn>...
+//   chesscli booktxt <vetted.txt> <book.bin>
 //   chesscli extract <out.txt> <perGame> <maxPositions> <pgn>...
 //   chesscli tune <data.txt> <out.inc> [epochs]
 #include <chrono>
@@ -62,8 +63,10 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    if (cmd == "mkbook" && argc > 4)
-        return buildBook(argv[2], std::atoi(argv[3]), std::vector<std::string>(argv + 4, argv + argc));
+    if (cmd == "mkbook" && argc > 6)
+        return buildBook(argv[2], std::atoi(argv[3]), std::atoi(argv[4]), std::atoi(argv[5]),
+                         std::vector<std::string>(argv + 6, argv + argc));
+    if (cmd == "booktxt" && argc > 3) return bookFromText(argv[2], argv[3]);
     if (cmd == "extract" && argc > 5)
         return extractPositions(argv[2], std::atoi(argv[3]), std::atoi(argv[4]),
                                 std::vector<std::string>(argv + 5, argv + argc));

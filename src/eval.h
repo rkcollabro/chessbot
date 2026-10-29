@@ -25,12 +25,25 @@ enum : int {
     OFF_BISHOP_PAIR,
     OFF_ROOK_OPEN,
     OFF_ROOK_SEMI_OPEN,
-    OFF_KING_ATTACK,                  // [attacker type]: attacked squares in the enemy king zone
-    OFF_SAFE_CHECK = OFF_KING_ATTACK + 7,  // [checker type]: safe checking squares
-    OFF_SHIELD = OFF_SAFE_CHECK + 7,  // [0] pawn in front of king, [1] two ahead, [2] open file near king
-    OFF_PAWN_THREAT = OFF_SHIELD + 3, // our pawns attacking enemy pieces
+    OFF_SHIELD,                       // [0] own pawn in front of king, [1] two ahead
+    OFF_STORM = OFF_SHIELD + 2,       // [relative rank] our pawns advancing on the enemy king's files
+    OFF_KING_FILE = OFF_STORM + 8,    // [0] semi-open, [1] open file next to the enemy king
+    OFF_PAWN_THREAT = OFF_KING_FILE + 2,  // our pawns attacking enemy pieces
     OFF_TEMPO,
-    NUM_PARAMS
+    OFF_KING_DANGER,                  // [KD_*] inputs to the quadratic king danger (mg field only)
+    NUM_PARAMS = OFF_KING_DANGER + 12
+};
+
+// King danger inputs, computed for each side attacking the enemy king. The weighted sum d adds
+// d*d/4096 to the attacker's middlegame score and d/16 to its endgame score (when d > 0).
+enum : int {
+    KD_ATTACKER_N, KD_ATTACKER_B, KD_ATTACKER_R, KD_ATTACKER_Q,  // pieces hitting the king zone
+    KD_ZONE_ATTACKS,                                              // attacked king-zone squares
+    KD_CHECK_N, KD_CHECK_B, KD_CHECK_R, KD_CHECK_Q,              // safe checking squares
+    KD_WEAK_SQUARES,  // king-zone squares we attack that only the king defends
+    KD_NO_QUEEN,      // attacker has no queen
+    KD_BIAS,
+    KD_COUNT
 };
 
 extern Score PARAMS[NUM_PARAMS];
@@ -42,6 +55,7 @@ int evaluate(const Board& b);
 // Tuning support: the evaluation as a linear function of PARAMS.
 struct EvalTrace {
     std::vector<std::pair<int16_t, int16_t>> features;  // (param index, white count - black count)
+    int16_t kingDanger[2][KD_COUNT] = {};                // king danger inputs per attacking color
     int phase = 0;
     bool linear = true;  // false if non-tunable adjustments (mop-up, draw scaling) apply
 };

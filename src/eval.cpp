@@ -49,12 +49,24 @@ struct ScoreAcc {
         mg += PARAMS[idx].mg * n;
         eg += PARAMS[idx].eg * n;
     }
+    void kingDanger(int color, const int* f) {
+        int d = 0;
+        for (int k = 0; k < KD_COUNT; k++) d += PARAMS[OFF_KING_DANGER + k].mg * f[k];
+        if (d <= 0) return;
+        int sign = color == WHITE ? 1 : -1;
+        mg += sign * (d * d / 4096);
+        eg += sign * (d / 16);
+    }
 };
 
 // Records feature counts for the tuner.
 struct TraceAcc {
     int16_t counts[NUM_PARAMS] = {};
+    int16_t danger[2][KD_COUNT] = {};
     void add(int idx, int color, int n) { counts[idx] += int16_t(color == WHITE ? n : -n); }
+    void kingDanger(int color, const int* f) {
+        for (int k = 0; k < KD_COUNT; k++) danger[color][k] = int16_t(f[k]);
+    }
 };
 
 inline int relSquare(int c, int s) { return c == WHITE ? s : s ^ 56; }
@@ -77,10 +89,10 @@ int evalCore(const Board& b, Acc& acc) {
     };
     PieceAtt list[2][32];
     int n[2] = {0, 0};
-    Bitboard attackedBy[2];
+    Bitboard attackedBy[2], attackedByNoKing[2];
     int phase = 0;
     for (int c = 0; c < 2; c++) {
-        attackedBy[c] = pawnAtt[c] | attacks::king(b.kingSq[c]);
+        attackedByNoKing[c] = pawnAtt[c];
         for (int t = KNIGHT; t <= QUEEN; t++)
             for (Bitboard bb = b.bb(c, t); bb;) {
                 int s = popLsb(bb);
@@ -89,9 +101,10 @@ int evalCore(const Board& b, Acc& acc) {
                              : t == ROOK   ? attacks::rook(s, occ)
                                            : attacks::queen(s, occ);
                 list[c][n[c]++] = {t, s, a};
-                attackedBy[c] |= a;
+                attackedByNoKing[c] |= a;
                 phase += t == QUEEN ? 4 : t == ROOK ? 2 : 1;
             }
+        attackedBy[c] = attackedByNoKing[c] | attacks::king(b.kingSq[c]);
     }
 
     for (int c = 0; c < 2; c++) {
@@ -107,19 +120,30 @@ int evalCore(const Board& b, Acc& acc) {
                 acc.add(OFF_PST + t * 64 + relSquare(c, s), c, 1);
             }
 
-        // Mobility, king attacks, safe checks.
+        // Mobility, and the inputs to king danger against the enemy king.
         const Bitboard mobArea = ~b.occ[c] & ~pawnAtt[e];
-        const Bitboard kingZone = attacks::king(ek) | bit(ek);
+        Bitboard kingZone = attacks::king(ek) | bit(ek);
+        kingZone |= e == WHITE ? kingZone << 8 : kingZone >> 8;  // include the rank in front of it
         const Bitboard safe = ~b.occ[c] & ~attackedBy[e];
         const Bitboard checkB = attacks::bishop(ek, occ), checkR = attacks::rook(ek, occ);
         const Bitboard checkSq[6] = {0, 0, attacks::knight(ek), checkB, checkR, checkB | checkR};
         static const int MOB_OFF[6] = {0, 0, OFF_MOB_N, OFF_MOB_B, OFF_MOB_R, OFF_MOB_Q};
+        int kd[KD_COUNT] = {};
         for (int i = 0; i < n[c]; i++) {
             const PieceAtt& p = list[c][i];
             acc.add(MOB_OFF[p.t] + popcount(p.a & mobArea), c, 1);
-            if (int k = popcount(p.a & kingZone)) acc.add(OFF_KING_ATTACK + p.t, c, k);
-            if (int k = popcount(p.a & checkSq[p.t] & safe)) acc.add(OFF_SAFE_CHECK + p.t, c, k);
+            if (Bitboard z = p.a & kingZone) {
+                kd[KD_ATTACKER_N + p.t - KNIGHT]++;
+                kd[KD_ZONE_ATTACKS] += popcount(z);
+            }
+            kd[KD_CHECK_N + p.t - KNIGHT] += popcount(p.a & checkSq[p.t] & safe);
         }
+        kd[KD_WEAK_SQUARES] = popcount(kingZone & attackedBy[c] & ~attackedByNoKing[e]);
+        kd[KD_NO_QUEEN] = b.bb(c, QUEEN) ? 0 : 1;
+        kd[KD_BIAS] = 1;
+        // Only meaningful with at least two attackers, as a lone piece rarely mates.
+        if (kd[KD_ATTACKER_N] + kd[KD_ATTACKER_B] + kd[KD_ATTACKER_R] + kd[KD_ATTACKER_Q] >= 2)
+            acc.kingDanger(c, kd);
 
         // Pawn structure.
         for (Bitboard bb = ownPawns; bb;) {
@@ -138,7 +162,7 @@ int evalCore(const Board& b, Acc& acc) {
             if (!(file & ownPawns)) acc.add((file & enemyPawns) ? OFF_ROOK_SEMI_OPEN : OFF_ROOK_OPEN, c, 1);
         }
 
-        // King shelter.
+        // Our king's pawn shelter.
         {
             int k = b.kingSq[c], kf = fileOf(k), kr = rankOf(relSquare(c, k));
             Bitboard files = fileMask(kf) | ADJ_FILES[kf];
@@ -150,10 +174,19 @@ int evalCore(const Board& b, Acc& acc) {
                     acc.add(OFF_SHIELD + 1, c, popcount(ownPawns & files & r2));
                 }
             }
-            int open = 0;
-            for (int f = std::max(0, kf - 1); f <= std::min(7, kf + 1); f++)
-                if (!(ownPawns & fileMask(f))) open++;
-            acc.add(OFF_SHIELD + 2, c, open);
+        }
+
+        // Pressure on the enemy king's files: pawn storms and open lines.
+        {
+            int ekf = fileOf(ek);
+            for (int f = std::max(0, ekf - 1); f <= std::min(7, ekf + 1); f++) {
+                Bitboard file = fileMask(f);
+                for (Bitboard bb = ownPawns & file; bb;) {
+                    int s = popLsb(bb);
+                    acc.add(OFF_STORM + rankOf(relSquare(c, s)), c, 1);
+                }
+                if (!(enemyPawns & file)) acc.add(OFF_KING_FILE + ((ownPawns & file) ? 0 : 1), c, 1);
+            }
         }
 
         // Threats: pawns attacking pieces.
@@ -216,6 +249,7 @@ void traceEval(const Board& b, EvalTrace& t) {
     t.features.clear();
     for (int i = 0; i < NUM_PARAMS; i++)
         if (acc.counts[i]) t.features.push_back({int16_t(i), acc.counts[i]});
+    std::memcpy(t.kingDanger, acc.danger, sizeof(acc.danger));
     ScoreAcc sa;
     evalCore(b, sa);
     int raw = (sa.mg * t.phase + sa.eg * (MAX_PHASE - t.phase)) / MAX_PHASE;
@@ -276,14 +310,15 @@ void resetDefaultParams() {
     PARAMS[OFF_BISHOP_PAIR] = {30, 50};
     PARAMS[OFF_ROOK_OPEN] = {20, 10};
     PARAMS[OFF_ROOK_SEMI_OPEN] = {10, 5};
-    const int KA[7] = {0, 0, 8, 8, 6, 5, 0}, SC[7] = {0, 0, 10, 6, 10, 8, 0};
-    for (int t = 0; t < 7; t++) {
-        PARAMS[OFF_KING_ATTACK + t] = {KA[t], 0};
-        PARAMS[OFF_SAFE_CHECK + t] = {SC[t], 0};
-    }
     PARAMS[OFF_SHIELD + 0] = {10, 0};
     PARAMS[OFF_SHIELD + 1] = {5, 0};
-    PARAMS[OFF_SHIELD + 2] = {-15, 0};
+    const int STORM[8] = {0, 0, 0, 5, 10, 20, 10, 0};
+    for (int r = 0; r < 8; r++) PARAMS[OFF_STORM + r] = {STORM[r], 0};
+    PARAMS[OFF_KING_FILE + 0] = {10, 0};
+    PARAMS[OFF_KING_FILE + 1] = {25, 0};
+    // Starting king danger weights, in the spirit of Stockfish's classical evaluation.
+    const int KD[KD_COUNT] = {80, 50, 45, 10, 60, 300, 250, 400, 300, 150, -800, -60};
+    for (int k = 0; k < KD_COUNT; k++) PARAMS[OFF_KING_DANGER + k] = {KD[k], 0};
     PARAMS[OFF_PAWN_THREAT] = {40, 30};
     PARAMS[OFF_TEMPO] = {10, 10};
 }
