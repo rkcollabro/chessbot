@@ -43,6 +43,10 @@ On first launch the endgame tables are generated in the background (~5 min, ~260
   - Captures and promotions resolve through the smaller tables, which are generated first.
   - The search probes the tables at every node with ≤4 pieces. At the root, it picks the move that mates fastest (or loses slowest) straight from the table.
 
+## Credits
+
+The piece images are the "cburnett" set by Colin M.L. Burnett, which lichess uses by default. It is licensed GPLv2+ / BSD / GFDL. The images are in `assets/pieces`, embedded into the exe at build time, and drawn with GDI+.
+
 ## Tests
 
 ```

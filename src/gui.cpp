@@ -3,10 +3,13 @@
 #define NOMINMAX
 #include <windows.h>
 #include <windowsx.h>
+#include <objidl.h>
+#include <gdiplus.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -38,8 +41,6 @@ const COLORREF C_DARK = RGB(181, 136, 99);
 const COLORREF C_LAST_LIGHT = RGB(205, 210, 106);
 const COLORREF C_LAST_DARK = RGB(170, 162, 58);
 const COLORREF C_SELECT = RGB(130, 151, 105);
-const COLORREF C_CHECK = RGB(226, 82, 70);
-const COLORREF C_HINT = RGB(90, 110, 60);
 
 struct App {
     HWND hwnd = nullptr;
@@ -66,6 +67,56 @@ struct App {
 } g;
 
 int S(int v) { return MulDiv(v, g.dpi, 96); }
+
+// ---------------------------------------------------------------- piece images
+
+std::unique_ptr<Gdiplus::Bitmap> g_pieceSrc[16];     // full-size images from resources
+std::unique_ptr<Gdiplus::Bitmap> g_pieceScaled[16];  // pre-scaled to the current square size
+int g_scaledSize = 0;
+
+std::unique_ptr<Gdiplus::Bitmap> loadPngResource(int id) {
+    HRSRC res = FindResourceW(nullptr, MAKEINTRESOURCEW(id), MAKEINTRESOURCEW(10) /* RT_RCDATA */);
+    if (!res) return nullptr;
+    DWORD size = SizeofResource(nullptr, res);
+    const void* data = LockResource(LoadResource(nullptr, res));
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (!data || !mem) return nullptr;
+    memcpy(GlobalLock(mem), data, size);
+    GlobalUnlock(mem);
+    IStream* stream = nullptr;
+    if (FAILED(CreateStreamOnHGlobal(mem, TRUE, &stream))) return nullptr;
+    std::unique_ptr<Gdiplus::Bitmap> decoded(Gdiplus::Bitmap::FromStream(stream));
+    std::unique_ptr<Gdiplus::Bitmap> copy;
+    if (decoded && decoded->GetLastStatus() == Gdiplus::Ok) {
+        // Copy so the image no longer depends on the stream.
+        int w = decoded->GetWidth(), h = decoded->GetHeight();
+        copy = std::make_unique<Gdiplus::Bitmap>(w, h, PixelFormat32bppPARGB);
+        Gdiplus::Graphics gr(copy.get());
+        gr.DrawImage(decoded.get(), 0, 0, w, h);
+    }
+    decoded.reset();
+    stream->Release();
+    return copy;
+}
+
+void loadPieceImages() {
+    for (int p = 1; p < 15; p++)
+        if (typeOf(p) >= PAWN && typeOf(p) <= KING) g_pieceSrc[p] = loadPngResource(100 + p);
+}
+
+void ensureScaledPieces(int size) {
+    if (size == g_scaledSize) return;
+    g_scaledSize = size;
+    for (int p = 0; p < 16; p++) {
+        g_pieceScaled[p].reset();
+        if (!g_pieceSrc[p]) continue;
+        g_pieceScaled[p] = std::make_unique<Gdiplus::Bitmap>(size, size, PixelFormat32bppPARGB);
+        Gdiplus::Graphics gr(g_pieceScaled[p].get());
+        gr.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        gr.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        gr.DrawImage(g_pieceSrc[p].get(), 0, 0, size, size);
+    }
+}
 
 std::wstring widen(const std::string& s) {
     if (s.empty()) return {};
@@ -332,17 +383,6 @@ void fillRect(HDC dc, const RECT& r, COLORREF c) {
     DeleteObject(b);
 }
 
-void ellipse(HDC dc, int cx, int cy, int rad, COLORREF fill, COLORREF pen, int penW) {
-    HBRUSH b = fill == CLR_INVALID ? (HBRUSH)GetStockObject(NULL_BRUSH) : CreateSolidBrush(fill);
-    HPEN p = penW ? CreatePen(PS_SOLID, penW, pen) : (HPEN)GetStockObject(NULL_PEN);
-    HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, p);
-    Ellipse(dc, cx - rad, cy - rad, cx + rad + 1, cy + rad + 1);
-    SelectObject(dc, ob);
-    SelectObject(dc, op);
-    if (fill != CLR_INVALID) DeleteObject(b);
-    if (penW) DeleteObject(p);
-}
-
 HFONT makeFont(const wchar_t* face, int px, int weight = FW_NORMAL) {
     return CreateFontW(-px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                        CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
@@ -363,7 +403,29 @@ void paintBoard(HDC dc, const Layout& L) {
         if (last && (s == moveFrom(last) || s == moveTo(last))) c = light ? C_LAST_LIGHT : C_LAST_DARK;
         if (s == g.selected) c = C_SELECT;
         fillRect(dc, r, c);
-        if (s == checkSq) ellipse(dc, (r.left + r.right) / 2, (r.top + r.bottom) / 2, L.sq * 9 / 20, C_CHECK, 0, 0);
+    }
+
+    Gdiplus::Graphics gr(dc);
+    gr.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    gr.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+
+    // King in check: lichess-style red radial glow.
+    if (checkSq >= 0) {
+        RECT r = squareRect(L, checkSq);
+        Gdiplus::GraphicsPath path;
+        path.AddEllipse(Gdiplus::RectF(Gdiplus::REAL(r.left) - L.sq * 0.2f, Gdiplus::REAL(r.top) - L.sq * 0.2f,
+                                       L.sq * 1.4f, L.sq * 1.4f));
+        Gdiplus::PathGradientBrush glow(&path);
+        glow.SetCenterColor(Gdiplus::Color(255, 255, 0, 0));
+        Gdiplus::Color edge(0, 169, 0, 0);
+        int n = 1;
+        glow.SetSurroundColors(&edge, &n);
+        const Gdiplus::REAL blend[] = {0.0f, 0.35f, 1.0f};
+        const Gdiplus::REAL pos[] = {0.0f, 0.4f, 1.0f};
+        glow.SetBlend(blend, pos, 3);
+        gr.SetClip(Gdiplus::Rect(r.left, r.top, L.sq, L.sq));
+        gr.FillPath(&glow, &path);
+        gr.ResetClip();
     }
 
     // Coordinates.
@@ -380,36 +442,28 @@ void paintBoard(HDC dc, const Layout& L) {
     SelectObject(dc, old);
     DeleteObject(coord);
 
-    // Pieces: a solid glyph for the body and, for white, the outline glyph on top for detail.
-    const wchar_t SOLID[7] = {0, 0x265F, 0x265E, 0x265D, 0x265C, 0x265B, 0x265A};
-    const wchar_t OUTLINE[7] = {0, 0x2659, 0x2658, 0x2657, 0x2656, 0x2655, 0x2654};
-    HFONT pf = makeFont(L"Segoe UI Symbol", L.sq * 4 / 5);
-    old = SelectObject(dc, pf);
+    // Pieces (cburnett images, as on lichess).
+    ensureScaledPieces(L.sq);
     for (int s = 0; s < 64; s++) {
         int p = g.board.sq[s];
-        if (!p) continue;
+        if (!p || !g_pieceScaled[p]) continue;
         RECT r = squareRect(L, s);
-        OffsetRect(&r, 0, L.sq / 40);
-        int t = typeOf(p);
-        UINT fmt = DT_CENTER | DT_VCENTER | DT_SINGLELINE;
-        if (colorOf(p) == WHITE) {
-            drawText(dc, std::wstring(1, SOLID[t]), r, RGB(255, 255, 255), fmt);
-            drawText(dc, std::wstring(1, OUTLINE[t]), r, RGB(25, 25, 25), fmt);
-        } else {
-            drawText(dc, std::wstring(1, SOLID[t]), r, RGB(25, 25, 25), fmt);
-        }
+        gr.DrawImage(g_pieceScaled[p].get(), int(r.left), int(r.top), L.sq, L.sq);
     }
-    SelectObject(dc, old);
-    DeleteObject(pf);
 
-    // Legal destination hints.
+    // Legal destination hints: translucent dots, and a ring around capturable pieces.
+    Gdiplus::SolidBrush hint(Gdiplus::Color(128, 20, 85, 30));
     for (Move m : g.targets) {
         RECT r = squareRect(L, moveTo(m));
-        int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
-        if (g.board.sq[moveTo(m)] || (moveFlags(m) & MF_EP))
-            ellipse(dc, cx, cy, L.sq * 9 / 20, CLR_INVALID, C_HINT, std::max(2, L.sq / 14));
-        else
-            ellipse(dc, cx, cy, L.sq / 7, C_HINT, 0, 0);
+        Gdiplus::REAL cx = (r.left + r.right) / 2.0f, cy = (r.top + r.bottom) / 2.0f;
+        if (g.board.sq[moveTo(m)] || (moveFlags(m) & MF_EP)) {
+            Gdiplus::REAL w = L.sq * 0.09f, rad = L.sq / 2.0f - w / 2;
+            Gdiplus::Pen ring(Gdiplus::Color(110, 20, 85, 30), w);
+            gr.DrawEllipse(&ring, cx - rad, cy - rad, 2 * rad, 2 * rad);
+        } else {
+            Gdiplus::REAL rad = L.sq * 0.14f;
+            gr.FillEllipse(&hint, cx - rad, cy - rad, 2 * rad, 2 * rad);
+        }
     }
 }
 
@@ -635,6 +689,10 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     SetProcessDPIAware();
     initTables();
+    Gdiplus::GdiplusStartupInput gdipInput;
+    ULONG_PTR gdipToken;
+    Gdiplus::GdiplusStartup(&gdipToken, &gdipInput, nullptr);
+    loadPieceImages();
     {
         HDC screen = GetDC(nullptr);
         g.dpi = GetDeviceCaps(screen, LOGPIXELSY);
@@ -675,5 +733,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    for (int p = 0; p < 16; p++) g_pieceSrc[p].reset(), g_pieceScaled[p].reset();
+    Gdiplus::GdiplusShutdown(gdipToken);
     return 0;
 }

@@ -1,0 +1,13 @@
+// Piece images (cburnett set, as used by lichess), resource id = 100 + piece code.
+101 RCDATA "assets\\pieces\\wP.png"
+102 RCDATA "assets\\pieces\\wN.png"
+103 RCDATA "assets\\pieces\\wB.png"
+104 RCDATA "assets\\pieces\\wR.png"
+105 RCDATA "assets\\pieces\\wQ.png"
+106 RCDATA "assets\\pieces\\wK.png"
+109 RCDATA "assets\\pieces\\bP.png"
+110 RCDATA "assets\\pieces\\bN.png"
+111 RCDATA "assets\\pieces\\bB.png"
+112 RCDATA "assets\\pieces\\bR.png"
+113 RCDATA "assets\\pieces\\bQ.png"
+114 RCDATA "assets\\pieces\\bK.png"
