@@ -186,6 +186,8 @@ public:
     int hardMs = 1000;   // absolute limit, used while the root move is failing low
     int softMs = 0;      // clock games: target time, scaled by how unsettled the search is (0 = fixed time)
     bool failLow = false;
+    std::atomic<bool>* ponderFlag = nullptr;  // set while pondering; "ponderhit" clears it
+    bool pondering = false;                   // main thread: no time limits until the ponderhit
     bool stopped = false;
     bool useBook = false;
     int iterDepth = 0;
@@ -206,6 +208,7 @@ public:
     int pieceStack[MAX_PLY];
     Move excluded[MAX_PLY];
     Move rootBest = NO_MOVE;
+    Move pvMove = NO_MOVE, pvReply = NO_MOVE;  // first two moves of the last completed iteration's PV
     int rootScore = 0;
 
     Searcher() { clearMemory(); }
@@ -220,10 +223,20 @@ public:
         return int(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count());
     }
 
+    // On "ponderhit" the normal time limits start to apply, counted from that moment. If pondering already
+    // took longer than the move's target time, move at once.
+    void checkPonderhit() {
+        if (!pondering || ponderFlag->load()) return;
+        pondering = false;
+        if (softMs && elapsed() >= softMs) shared->stop = true;
+        start = Clock::now();
+    }
+
     void checkTime() {
         shared->nodes.fetch_add(1024, std::memory_order_relaxed);
+        if (id == 0) checkPonderhit();
         if (id == 0 && iterDepth > 1 &&
-            ((stopFlag && stopFlag->load()) || elapsed() >= (failLow ? hardMs : limitMs)))
+            ((stopFlag && stopFlag->load()) || (!pondering && elapsed() >= (failLow ? hardMs : limitMs))))
             shared->stop = true;
         if (iterDepth > 1 && shared->stop.load(std::memory_order_relaxed)) stopped = true;
     }
@@ -576,6 +589,8 @@ public:
         limitMs = hardMs = ms;
         softMs = soft;
         failLow = false;
+        pondering = false;
+        pvMove = pvReply = NO_MOVE;
         maxNodes = nodeLimit;
         noise = evalNoise;
         noiseSeed = uint64_t(Clock::now().time_since_epoch().count()) * 0xD1B54A32D192ED03ULL;
@@ -658,6 +673,7 @@ public:
             bool done = searchDepth(depth, score);
             if (rootBest) best = rootBest;  // a move fully searched this iteration is trustworthy
             if (!done) break;
+            if (pvLen[0] >= 2) pvMove = pv[0][0], pvReply = pv[0][1];
             if (info) {
                 SearchInfo si;
                 si.depth = depth;
@@ -668,8 +684,10 @@ public:
                 info(si);
             }
             if (maxNodes && nodes >= maxNodes) break;
+            checkPonderhit();
+            if (shared->stop) break;
             if (!softMs) {
-                if (elapsed() > limitMs / 2) break;
+                if (!pondering && elapsed() > limitMs / 2) break;
             } else {
                 // Clock games: spend more time while the best move keeps changing or the score is dropping,
                 // less once the same move has held for several iterations.
@@ -683,7 +701,7 @@ public:
                 limitMs = std::min(hardMs, int(target * 2));
                 prevBest = best;
                 prevScore = score;
-                if (elapsed() > target) break;
+                if (!pondering && elapsed() > target) break;
             }
             if (std::abs(score) > MATE_BOUND && depth > MATE - std::abs(score) + 2) break;
         }
@@ -720,7 +738,8 @@ std::vector<std::unique_ptr<Searcher>> g_pool;
 }  // namespace
 
 Move findBestMove(const Board& root, int timeMs, std::atomic<bool>* stop, const InfoFn& info, bool useBook,
-                  int threads, int maxNodes, int evalNoise, int softMs) {
+                  int threads, int maxNodes, int evalNoise, int softMs, std::atomic<bool>* ponder,
+                  Move* ponderMove) {
     threads = maxNodes ? 1 : std::max(1, std::min(threads, 64));  // node limits are per thread
     while (int(g_pool.size()) < threads) {
         g_pool.push_back(std::make_unique<Searcher>());
@@ -735,7 +754,11 @@ Move findBestMove(const Board& root, int timeMs, std::atomic<bool>* stop, const 
     Searcher& main = *g_pool[0];
     main.stopFlag = stop;
     main.useBook = useBook;
-    return main.think(info, helpers);
+    main.ponderFlag = ponder;
+    main.pondering = ponder && ponder->load();
+    Move best = main.think(info, helpers);
+    if (ponderMove) *ponderMove = main.pvMove == best ? main.pvReply : NO_MOVE;
+    return best;
 }
 
 int quiescenceScore(const Board& pos) {
