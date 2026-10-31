@@ -97,16 +97,18 @@ struct LmrInit {
 // with both sides always recapturing with their least valuable piece. Works for quiet moves too
 // (it then tells whether the moved piece can be won).
 int see(const Board& b, Move m) {
+    if (moveFlags(m) & MF_CASTLE) return 0;
     int from = moveFrom(m), to = moveTo(m);
     int gain[32], d = 0;
     int target = (moveFlags(m) & MF_EP) ? PAWN : typeOf(b.sq[to]);
-    int attacker = typeOf(b.sq[from]);
+    int attacker = isDrop(m) ? dropType(m) : typeOf(b.sq[from]);
     gain[0] = PIECE_VALUE[target];
     if (movePromo(m)) {
         gain[0] += PIECE_VALUE[movePromo(m)] - PIECE_VALUE[PAWN];
         attacker = movePromo(m);
     }
-    Bitboard occ = b.occAll ^ bit(from);
+    // A dropped piece lands on an empty square without vacating one.
+    Bitboard occ = isDrop(m) ? b.occAll | bit(to) : b.occAll ^ bit(from);
     if (moveFlags(m) & MF_EP) occ ^= bit(to + (b.stm == WHITE ? -8 : 8));
     const Bitboard diag = b.bb(0, BISHOP) | b.bb(1, BISHOP) | b.bb(0, QUEEN) | b.bb(1, QUEEN);
     const Bitboard orth = b.bb(0, ROOK) | b.bb(1, ROOK) | b.bb(0, QUEEN) | b.bb(1, QUEEN);
@@ -137,6 +139,34 @@ int see(const Board& b, Move m) {
     return gain[0];
 }
 
+// Endgame tables and the opening book only know the standard rules.
+inline bool tablebaseRules(const Board& b) { return b.variant == STANDARD || b.variant == CHESS960; }
+
+// A move that wins on the spot by a variant rule: a third check, or the king stepping onto the hill.
+// Lets the quiescence search see these wins, since it otherwise only looks at captures.
+bool hasVariantWinNow(Board& b) {
+    if (b.variant == THREE_CHECK && b.checks[b.stm] == 2) {
+        MoveList ml;
+        b.genMoves(ml);
+        for (int i = 0; i < ml.count; i++) {
+            if (!b.makeMove(ml.moves[i])) continue;
+            bool win = b.inCheck();
+            b.unmakeMove();
+            if (win) return true;
+        }
+    } else if (b.variant == KING_OF_THE_HILL && b.kingSq[b.stm] >= 0) {
+        int from = b.kingSq[b.stm];
+        for (Bitboard to = attacks::king(from) & CENTER & ~b.occ[b.stm]; to;) {
+            int t = popLsb(to);
+            if (b.makeMove(encodeMove(from, t, 0, b.sq[t] ? MF_CAPTURE : 0))) {
+                b.unmakeMove();
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 using Clock = std::chrono::steady_clock;
 
 // State shared by all threads of one search.
@@ -152,11 +182,17 @@ public:
     Shared* shared = nullptr;
     std::atomic<bool>* stopFlag = nullptr;  // external "move now" request
     Clock::time_point start;
-    int limitMs = 1000;
+    int limitMs = 1000;  // stop the search mid-iteration after this long
+    int hardMs = 1000;   // absolute limit, used while the root move is failing low
+    int softMs = 0;      // clock games: target time, scaled by how unsettled the search is (0 = fixed time)
+    bool failLow = false;
     bool stopped = false;
     bool useBook = false;
     int iterDepth = 0;
     uint64_t nodes = 0;
+    uint64_t maxNodes = 0;     // weaker levels: stop after this many nodes (single thread)
+    int noise = 0;             // weaker levels: evaluation noise in centipawns
+    uint64_t noiseSeed = 0;
 
     // Move ordering memory, kept between moves of a game (per thread).
     Move killers[MAX_PLY][2];
@@ -186,9 +222,20 @@ public:
 
     void checkTime() {
         shared->nodes.fetch_add(1024, std::memory_order_relaxed);
-        if (id == 0 && iterDepth > 1 && ((stopFlag && stopFlag->load()) || elapsed() >= limitMs))
+        if (id == 0 && iterDepth > 1 &&
+            ((stopFlag && stopFlag->load()) || elapsed() >= (failLow ? hardMs : limitMs)))
             shared->stop = true;
         if (iterDepth > 1 && shared->stop.load(std::memory_order_relaxed)) stopped = true;
+    }
+
+    // The static evaluation, blurred for the weaker levels. The noise depends only on the position and a
+    // per-search seed, so a position gets the same value wherever it shows up in the tree.
+    int eval() {
+        int e = evaluate(b);
+        if (!noise) return e;
+        uint64_t z = (b.hash ^ noiseSeed) * 0x9E3779B97F4A7C15ULL;
+        z ^= z >> 29;
+        return e + int(z % uint64_t(2 * noise + 1)) - noise;
     }
 
     void updateHistory(int& h, int bonus) { h += bonus - h * std::abs(bonus) / 16384; }
@@ -229,12 +276,15 @@ public:
     int qsearch(int alpha, int beta, int ply) {
         pvLen[ply] = ply;
         if ((++nodes & 1023) == 0) checkTime();
+        if (maxNodes && nodes >= maxNodes && iterDepth > 1) stopped = true;
         if (stopped) return 0;
-        if (b.pieceCount <= 4) {
+        if (b.variantOutcome()) return -MATE + ply;
+        if (b.pieceCount <= 4 && tablebaseRules(b)) {
             int v;
             if (tb::probe(b, v)) return tbScore(v, ply);
         }
-        if (ply >= MAX_PLY - 1) return evaluate(b);
+        if (ply >= MAX_PLY - 1) return eval();
+        if (b.variant != STANDARD && hasVariantWinNow(b)) return MATE - ply - 1;
 
         TTData tt;
         Move ttMove = NO_MOVE;
@@ -249,13 +299,13 @@ public:
         int best = -INF;
         const int origAlpha = alpha;
         if (!inCheck) {
-            best = evaluate(b);
+            best = eval();
             if (best >= beta) return best;
             if (best > alpha) alpha = best;
         }
         MoveList ml;
         b.genMoves(ml, !inCheck);
-        int scores[256];
+        int scores[MAX_MOVES];
         for (int i = 0; i < ml.count; i++) scores[i] = scoreMove(ml.moves[i], ttMove, ply, NO_MOVE);
         int legal = 0;
         Move bestMove = NO_MOVE;
@@ -293,14 +343,16 @@ public:
     int negamax(int depth, int alpha, int beta, int ply, bool nullOk) {
         pvLen[ply] = ply;
         if ((++nodes & 1023) == 0) checkTime();
+        if (maxNodes && nodes >= maxNodes && iterDepth > 1) stopped = true;
         if (stopped) return 0;
         const bool root = ply == 0;
         const bool pvNode = beta - alpha > 1;
         const Move excludedMove = excluded[ply];
 
         if (!root) {
+            if (b.variantOutcome()) return -MATE + ply;
             if (b.halfmove >= 100 || b.isRepetition() || b.insufficientMaterial()) return 0;
-            if (b.pieceCount <= 4) {
+            if (b.pieceCount <= 4 && tablebaseRules(b)) {
                 int v;
                 if (tb::probe(b, v)) return tbScore(v, ply);
             }
@@ -308,7 +360,7 @@ public:
             beta = std::min(beta, MATE - ply - 1);
             if (alpha >= beta) return alpha;
         }
-        if (ply >= MAX_PLY - 1) return evaluate(b);
+        if (ply >= MAX_PLY - 1) return eval();
 
         const bool inCheck = b.inCheck();
         if (inCheck) depth++;
@@ -329,7 +381,7 @@ public:
         else if (excludedMove)
             staticEval = evalStack[ply];  // same position, already evaluated
         else
-            staticEval = evaluate(b);
+            staticEval = eval();
         evalStack[ply] = staticEval;
         const bool improving = !inCheck && ply >= 2 && staticEval > evalStack[ply - 2];
 
@@ -355,7 +407,7 @@ public:
         MoveList ml;
         b.genMoves(ml);
         const Move counter = counterFor(ply);
-        int scores[256];
+        int scores[MAX_MOVES];
         for (int i = 0; i < ml.count; i++) scores[i] = scoreMove(ml.moves[i], ttMove, ply, counter);
 
         int legal = 0, best = -INF;
@@ -484,7 +536,7 @@ public:
 
     // With 4 or fewer pieces, pick the move with the best distance to mate straight from the tables.
     bool tablebaseRoot(Move& best, const InfoFn& info) {
-        if (b.pieceCount > 4 || b.ep >= 0 || b.castle) return false;
+        if (b.pieceCount > 4 || b.ep >= 0 || b.castle || !tablebaseRules(b)) return false;
         MoveList ml;
         b.genLegal(ml);
         if (!ml.count) return false;
@@ -518,10 +570,15 @@ public:
         return true;
     }
 
-    void prepare(const Board& root, Shared* sh, int ms) {
+    void prepare(const Board& root, Shared* sh, int ms, uint64_t nodeLimit = 0, int evalNoise = 0, int soft = 0) {
         b = root;
         shared = sh;
-        limitMs = ms;
+        limitMs = hardMs = ms;
+        softMs = soft;
+        failLow = false;
+        maxNodes = nodeLimit;
+        noise = evalNoise;
+        noiseSeed = uint64_t(Clock::now().time_since_epoch().count()) * 0xD1B54A32D192ED03ULL;
         stopped = false;
         nodes = 0;
         iterDepth = 0;
@@ -548,12 +605,15 @@ public:
             int s = negamax(depth, alpha, beta, 0, false);
             if (stopped) return false;
             if (s <= alpha) {
+                // The expected move is turning out worse: allow the main thread up to the hard limit.
+                if (id == 0 && depth >= 5) failLow = true;
                 beta = (alpha + beta) / 2;
                 alpha = std::max(s - delta, -INF);
             } else if (s >= beta) {
                 beta = std::min(s + delta, INF);
             } else {
                 score = s;
+                failLow = false;
                 return true;
             }
             delta += delta;
@@ -571,7 +631,7 @@ public:
     Move think(const InfoFn& info, const std::vector<Searcher*>& helpers) {
         Move best = NO_MOVE;
         if (tablebaseRoot(best, info)) return best;
-        if (useBook && book::loaded() && (best = book::probe(b))) {
+        if (useBook && b.variant == STANDARD && book::loaded() && (best = book::probe(b))) {
             if (info) {
                 SearchInfo si;
                 si.pv = pvToSAN(&best, 1);
@@ -585,12 +645,15 @@ public:
         b.genLegal(legal);
         if (!legal.count) return NO_MOVE;
         best = legal.moves[0];
-        if (legal.count == 1) limitMs = std::min(limitMs, 50);
+        if (legal.count == 1) limitMs = hardMs = std::min(limitMs, 50), softMs = std::min(softMs, 50);
 
         std::vector<std::thread> threads;
         for (Searcher* h : helpers) threads.emplace_back([h] { h->helperLoop(); });
 
-        int score = 0;
+        int score = 0, prevScore = 0, stableIters = 0;
+        double instability = 0;
+        Move prevBest = NO_MOVE;
+        if (softMs) limitMs = std::min(hardMs, softMs * 2);
         for (int depth = 1; depth < MAX_PLY - 8; depth++) {
             bool done = searchDepth(depth, score);
             if (rootBest) best = rootBest;  // a move fully searched this iteration is trustworthy
@@ -604,7 +667,24 @@ public:
                 si.pv = pvToSAN(pv[0], pvLen[0]);
                 info(si);
             }
-            if (elapsed() > limitMs / 2) break;
+            if (maxNodes && nodes >= maxNodes) break;
+            if (!softMs) {
+                if (elapsed() > limitMs / 2) break;
+            } else {
+                // Clock games: spend more time while the best move keeps changing or the score is dropping,
+                // less once the same move has held for several iterations.
+                bool changed = best != prevBest;
+                instability = instability * 0.5 + (changed && depth >= 5 ? 1.0 : 0.0);
+                stableIters = changed ? 0 : stableIters + 1;
+                double scale = 1.0 + 1.5 * instability;
+                if (depth >= 5) scale *= 1.0 + std::clamp((prevScore - score) / 100.0, 0.0, 1.0);
+                if (stableIters >= 6) scale *= 0.7;
+                double target = softMs * scale;
+                limitMs = std::min(hardMs, int(target * 2));
+                prevBest = best;
+                prevScore = score;
+                if (elapsed() > target) break;
+            }
             if (std::abs(score) > MATE_BOUND && depth > MATE - std::abs(score) + 2) break;
         }
         shared->stop = true;
@@ -613,14 +693,35 @@ public:
     }
 };
 
+}  // namespace
+
+// Elo relative to level 6, spaced evenly at 500 per level. Self-play put levels 1-5 about 450-630 apart
+// (README, "Levels"); the step to level 6 and to MAX was not measured, so these are approximate.
+const EngineLevel LEVELS[NUM_LEVELS] = {
+    {"Level 1", 3000, 1000, 150, false, -2500},
+    {"Level 2", 3000, 4000, 60, false, -2000},
+    {"Level 3", 3000, 20000, 25, true, -1500},
+    {"Level 4", 3000, 120000, 0, true, -1000},
+    {"Level 5", 3000, 800000, 0, true, -500},
+    {"Level 6", 3000, 0, 0, true, 0},
+    {"MAX", 30000, 0, 0, true, 500},
+};
+
+int defaultThreads() {
+    unsigned n = std::thread::hardware_concurrency();
+    return n ? int(std::min(n, 16u)) : 4;
+}
+
+namespace {
+
 // Searchers persist between moves so their move-ordering history carries over.
 std::vector<std::unique_ptr<Searcher>> g_pool;
 
 }  // namespace
 
 Move findBestMove(const Board& root, int timeMs, std::atomic<bool>* stop, const InfoFn& info, bool useBook,
-                  int threads) {
-    threads = std::max(1, std::min(threads, 64));
+                  int threads, int maxNodes, int evalNoise, int softMs) {
+    threads = maxNodes ? 1 : std::max(1, std::min(threads, 64));  // node limits are per thread
     while (int(g_pool.size()) < threads) {
         g_pool.push_back(std::make_unique<Searcher>());
         g_pool.back()->id = int(g_pool.size()) - 1;
@@ -628,7 +729,7 @@ Move findBestMove(const Board& root, int timeMs, std::atomic<bool>* stop, const 
     Shared shared;
     std::vector<Searcher*> helpers;
     for (int i = 0; i < threads; i++) {
-        g_pool[i]->prepare(root, &shared, timeMs);
+        g_pool[i]->prepare(root, &shared, timeMs, uint64_t(std::max(0, maxNodes)), evalNoise, softMs);
         if (i) helpers.push_back(g_pool[i].get());
     }
     Searcher& main = *g_pool[0];

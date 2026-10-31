@@ -22,7 +22,38 @@ On first launch the endgame tables are generated in the background (~5 min, ~260
 | Switch sides with the engine | Ctrl+E |
 | Force the engine to move now | Space |
 | Copy / paste FEN | Ctrl+C / Ctrl+V (pasting gives you the side to move) |
-| Think time | Engine menu: 1, 3, 5, 10, 30 seconds |
+| Strength | Level menu: Level 1 to Level 6, or MAX (see Levels) |
+| Variant | Variant menu (starts a new game as White) |
+
+## Variants
+
+Besides standard chess the engine plays five lichess variants, picked from the Variant menu or with the UCI `UCI_Variant` option:
+
+| Variant | Rules | In the GUI |
+|---|---|---|
+| Chess960 | Random back rank (one of 960); castling puts the king on g/c and the rook on f/d as usual | Each new game gets a random start. Castle by clicking the king, then its rook |
+| Three-check | Giving a third check also wins | The panel counts checks for both sides |
+| Crazyhouse | Captured pieces join your hand and can be dropped on any empty square instead of moving (pawns not on the first or last rank). Promoted pieces go back to the hand as pawns | Both hands show in the panel: click a piece in your hand, then an empty square |
+| King of the Hill | Getting your king to d4, e4, d5 or e5 also wins | The four center squares are tinted |
+| Horde | White has 36 pawns and no king, and wins by checkmate; Black wins by capturing every white piece. White pawns on the first rank may also move two squares | |
+
+FENs follow lichess / python-chess: crazyhouse hands in brackets with `~` after promoted pieces (`...RNBQKBNR[Qp] w ...`), three-check counters as checks remaining before the clocks (`... - 3+3 0 1`, the lichess `+1+0` suffix is also read), and Chess960 castling as `KQkq` or the rooks' files (`HFhf`). In UCI, drops are written `N@f3`, and Chess960 castling as king-takes-rook (`e1h1`).
+
+The opening book and the endgame tables only apply to standard chess (the tables also to Chess960 once castling is gone). The evaluation adds a few hand-set terms per variant on top of the tuned weights: pieces in hand and holes around the king for crazyhouse, a bonus per check given, the king's distance to the hill, and extra worth for the horde's pawns.
+
+## Levels
+
+| Level | How it plays | Elo vs Level 6 |
+|---|---|---|
+| Level 1 | 1,000 nodes a move, heavy evaluation noise, no book | about −2500 |
+| Level 2 | 4,000 nodes, strong noise, no book | about −2000 |
+| Level 3 | 20,000 nodes, light noise | about −1500 |
+| Level 4 | 120,000 nodes | about −1000 |
+| Level 5 | 800,000 nodes | about −500 |
+| Level 6 | full engine, 3 seconds a move, all threads (default) | 0 |
+| MAX | full engine, 30 seconds a move, all threads | about +500 |
+
+Levels 1–5 cap the nodes searched on one thread, so they play the same strength on any PC and usually move within a second or two. The ratings are spaced evenly and are only a rough guide: self-play matches (`tools/rate_levels.py`) put levels 1–5 about 450–630 Elo apart, and the gaps up to Level 6 and MAX were not measured. MAX's real gain from ten times the thinking time is probably smaller than 500. In UCI, the `Level` option (1–6) picks the level, and the time still comes from the `go` command.
 
 ## Engine
 
@@ -36,7 +67,8 @@ On first launch the endgame tables are generated in the background (~5 min, ~260
   - **Extensions:** check extensions and singular extensions (with multi-cut), plus internal iterative reduction when there is no remembered best move.
   - **Move ordering:** MVV-LVA with SEE, killer moves, counter-moves, and a history table that also penalizes moves that failed.
   - **Quiescence search:** drops SEE-losing captures, uses delta pruning and probes the transposition table.
-- **Multi-threading:** Lazy SMP. All threads search the same position and share a lockless transposition table. The GUI defaults to 4 threads (Engine menu: 1/2/4/8); UCI has a `Threads` option.
+- **Time management:** with a fixed time per move (GUI), it stops starting new iterations after half the time. On a clock (UCI `wtime`/`btime`), it aims for 1/25 of the remaining time plus 3/4 of the increment. It stretches that up to 5× (never more than a third of the clock) while the best move keeps changing, the score is dropping, or the root move fails low, and cuts it to 0.7× once the same move has held for six iterations.
+- **Multi-threading:** Lazy SMP. All threads search the same position and share a lockless transposition table. The GUI always uses every core, up to 16; UCI has a `Threads` option.
 - **Evaluation** (`eval.cpp`): a tapered (middlegame/endgame) linear evaluation with about 560 weights. Its terms are:
   - material and piece-square tables;
   - mobility, measured as safe squares per piece;
@@ -60,9 +92,11 @@ On first launch the endgame tables are generated in the background (~5 min, ~260
 ## Tools
 
 ```
-chesscli test                                    # perft suite + hash consistency
+chesscli test                                    # perft suite (standard + variants) + hash consistency
+chesscli perft <d> --variant crazyhouse [fen]    # variants: chess960, 3check, crazyhouse, kingofthehill, horde
+python tools/variant_perft.py [games] [seed]     # random variant positions, perft vs python-chess
 chesscli tbgen | tbprobe <fen> | search <ms> [fen]
-chesscli uci                                     # UCI engine (Arena, Cute Chess, lichess-bot, ...)
+chesscli uci                                     # UCI engine (Arena, Cute Chess, lichess-bot, ...); UCI_Variant, UCI_Chess960
 chesscli mkbook data/book_raw.txt 16 2500 180 games.pgn...   # plies, min Elo, min base seconds
 python tools/vet_book.py data/book_raw.txt data/book_vetted.txt  # needs Stockfish in tools/stockfish
 chesscli booktxt data/book_vetted.txt book.bin

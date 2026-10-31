@@ -38,7 +38,13 @@ Move probe(Board& b) {
     for (auto it = lo; it != g_entries.end() && it->key == b.hash; ++it) {
         for (int i = 0; i < legal.count; i++) {
             Move m = legal.moves[i];
-            if ((m & 0x7FFF) == it->move) {
+            // Castles are stored the classic way (king to g1/c1); moves now encode king takes rook.
+            uint16_t classic = uint16_t(m & 0x7FFF);
+            if (moveFlags(m) & MF_CASTLE) {
+                int kingTo = (moveFrom(m) & 56) + (moveTo(m) > moveFrom(m) ? 6 : 2);
+                classic = uint16_t(moveFrom(m) | (kingTo << 6));
+            }
+            if ((m & 0x7FFF) == it->move || classic == it->move) {
                 options.push_back({m, it->weight});
                 best = std::max<int>(best, it->weight);
             }

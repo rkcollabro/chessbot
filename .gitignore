@@ -5,3 +5,4 @@ tb/
 data/
 engines/
 tools/stockfish/
+__pycache__/

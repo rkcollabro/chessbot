@@ -16,8 +16,8 @@ if not exist build mkdir build
 set CFLAGS=/nologo /std:c++17 /O2 /EHsc /W3 /MT /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8
 set CORE=src\board.cpp src\eval.cpp src\search.cpp src\tablebase.cpp src\book.cpp
 
-cl %CFLAGS% /Fobuild\ /Fe:chesscli.exe %CORE% src\uci.cpp src\datagen.cpp src\cli.cpp || exit /b 1
+cl %CFLAGS% /Fobuild\ /Fe:chesscli.exe %CORE% src\uci.cpp src\datagen.cpp src\cli.cpp /link /STACK:8388608 || exit /b 1
 rc /nologo /fo build\resources.res src\resources.rc || exit /b 1
-cl %CFLAGS% /Fobuild\ /Fe:chessbot.exe %CORE% src\gui.cpp build\resources.res /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib gdiplus.lib ole32.lib || exit /b 1
+cl %CFLAGS% /Fobuild\ /Fe:chessbot.exe %CORE% src\gui.cpp build\resources.res /link /SUBSYSTEM:WINDOWS /STACK:8388608 user32.lib gdi32.lib gdiplus.lib ole32.lib || exit /b 1
 
 echo Build OK: chessbot.exe (GUI), chesscli.exe (tests)

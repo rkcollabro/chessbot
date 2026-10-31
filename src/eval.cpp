@@ -80,7 +80,7 @@ int evalCore(const Board& b, Acc& acc) {
     Bitboard attackedBy[2];
     int phase = 0;
     for (int c = 0; c < 2; c++) {
-        attackedBy[c] = pawnAtt[c] | attacks::king(b.kingSq[c]);
+        attackedBy[c] = pawnAtt[c] | (b.kingSq[c] >= 0 ? attacks::king(b.kingSq[c]) : 0);
         for (int t = KNIGHT; t <= QUEEN; t++)
             for (Bitboard bb = b.bb(c, t); bb;) {
                 int s = popLsb(bb);
@@ -109,10 +109,11 @@ int evalCore(const Board& b, Acc& acc) {
 
         // Mobility, king attacks, safe checks.
         const Bitboard mobArea = ~b.occ[c] & ~pawnAtt[e];
-        const Bitboard kingZone = attacks::king(ek) | bit(ek);
+        const bool hasKing = ek >= 0;
+        const Bitboard kingZone = hasKing ? attacks::king(ek) | bit(ek) : 0;
         const Bitboard safe = ~b.occ[c] & ~attackedBy[e];
-        const Bitboard checkB = attacks::bishop(ek, occ), checkR = attacks::rook(ek, occ);
-        const Bitboard checkSq[6] = {0, 0, attacks::knight(ek), checkB, checkR, checkB | checkR};
+        const Bitboard checkB = hasKing ? attacks::bishop(ek, occ) : 0, checkR = hasKing ? attacks::rook(ek, occ) : 0;
+        const Bitboard checkSq[6] = {0, 0, hasKing ? attacks::knight(ek) : 0, checkB, checkR, checkB | checkR};
         static const int MOB_OFF[6] = {0, 0, OFF_MOB_N, OFF_MOB_B, OFF_MOB_R, OFF_MOB_Q};
         for (int i = 0; i < n[c]; i++) {
             const PieceAtt& p = list[c][i];
@@ -139,7 +140,7 @@ int evalCore(const Board& b, Acc& acc) {
         }
 
         // King shelter.
-        {
+        if (b.kingSq[c] >= 0) {
             int k = b.kingSq[c], kf = fileOf(k), kr = rankOf(relSquare(c, k));
             Bitboard files = fileMask(kf) | ADJ_FILES[kf];
             if (kr < 6) {
@@ -183,7 +184,7 @@ bool adjust(const Board& b, int& score) {
     // Mop-up: with a lone enemy king, drive it to the edge and bring our king close.
     for (int c = 0; c < 2; c++) {
         int o = c ^ 1;
-        if (mat[o] == 0 && pawns[o] == 0 && mat[c] >= 500) {
+        if (mat[o] == 0 && pawns[o] == 0 && mat[c] >= 500 && b.kingSq[0] >= 0 && b.kingSq[1] >= 0) {
             int lk = b.kingSq[o], wk = b.kingSq[c];
             int dist = std::abs(fileOf(lk) - fileOf(wk)) + std::abs(rankOf(lk) - rankOf(wk));
             int bonus = 10 * centerDistance(lk) + 4 * (14 - dist);
@@ -200,13 +201,63 @@ bool adjust(const Board& b, int& score) {
     return applied;
 }
 
+// Kings: steps (king moves) to the nearest of d4/e4/d5/e5.
+inline int hillDistance(int s) {
+    int f = fileOf(s), r = rankOf(s);
+    return std::max(std::max(3 - f, f - 4), std::max(3 - r, r - 4));
+}
+
+// Hand-set terms for the variants, outside the tuned model. White's point of view.
+int variantTerms(const Board& b) {
+    int score = 0;
+    for (int c = 0; c < 2; c++) {
+        const int sign = c == WHITE ? 1 : -1, e = c ^ 1;
+        const int k = b.kingSq[c];
+        switch (b.variant) {
+            case CRAZYHOUSE: {
+                // Pieces in hand are full material, and pawns are worth more since they drop anywhere.
+                static const int HAND[7] = {0, 120, 320, 330, 480, 900, 0};
+                for (int t = PAWN; t <= QUEEN; t++) score += sign * HAND[t] * b.pocket[c][t];
+                // Empty squares next to the king are landing spots for the opponent's drops.
+                static const int DROP_THREAT[7] = {0, 1, 2, 2, 3, 4, 0};
+                int threat = 0;
+                for (int t = PAWN; t <= QUEEN; t++) threat += DROP_THREAT[t] * b.pocket[e][t];
+                int holes = popcount(attacks::king(k) & ~b.occAll);
+                score -= sign * holes * std::min(threat, 12) * 3;
+                break;
+            }
+            case THREE_CHECK: {
+                static const int CHECK_BONUS[4] = {0, 110, 320, 0};
+                score += sign * CHECK_BONUS[std::min(b.checks[c], 3)];
+                break;
+            }
+            case KING_OF_THE_HILL: {
+                static const int HILL_BONUS[5] = {0, 160, 70, 30, 10};
+                if (k >= 0) score += sign * HILL_BONUS[std::min(hillDistance(k), 4)];
+                break;
+            }
+            case HORDE:
+                // The horde's pawns protect each other far better than ordinary material counting assumes;
+                // without this the 36 pawns look about 7 pawns worse than Black's army at the start.
+                if (c == WHITE) score += 20 * popcount(b.bb(WHITE, PAWN));
+                break;
+            default: break;
+        }
+    }
+    return score;
+}
+
 }  // namespace
 
 int evaluate(const Board& b) {
     ScoreAcc acc;
     int phase = evalCore(b, acc);
     int score = (acc.mg * phase + acc.eg * (MAX_PHASE - phase)) / MAX_PHASE;
-    adjust(b, score);
+    // Mop-up and drawish scaling assume standard rules.
+    if (b.variant == STANDARD || b.variant == CHESS960)
+        adjust(b, score);
+    else
+        score += variantTerms(b);
     return b.stm == WHITE ? score : -score;
 }
 

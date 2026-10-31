@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -29,11 +30,9 @@ enum {
 enum {
     ID_NEW_WHITE = 101, ID_NEW_BLACK, ID_UNDO, ID_FLIP, ID_COPY_FEN, ID_PASTE_FEN, ID_EXIT,
     ID_SWITCH_SIDES = 201, ID_MOVE_NOW,
-    ID_TIME_BASE = 300,  // + index into THINK_TIMES
-    ID_THREADS_BASE = 400,  // + index into THREAD_COUNTS
+    ID_LEVEL_BASE = 300,    // + index into LEVELS
+    ID_VARIANT_BASE = 500,  // + Variant
 };
-const int THINK_TIMES[] = {1000, 3000, 5000, 10000, 30000};
-const int THREAD_COUNTS[] = {1, 2, 4, 8};
 
 const COLORREF C_BG = RGB(38, 36, 33);
 const COLORREF C_PANEL_TEXT = RGB(222, 220, 214);
@@ -55,10 +54,11 @@ struct App {
     int startFullmove = 1;
     Color human = WHITE;
     bool flipped = false;
-    int selected = -1;
+    Variant variant = STANDARD;
+    int selected = -1;  // square, or 64 + piece type for a piece in hand (crazyhouse)
     std::vector<Move> targets;
-    int thinkIndex = 1;
-    int threadIndex = 2;  // 4 threads
+    std::vector<std::pair<RECT, int>> handRects;  // the human's pieces in hand, for clicks
+    int level = 5;  // index into LEVELS: Level 6, the full engine at 3 s a move
     std::string gameOver;
 
     std::thread engine;
@@ -177,12 +177,20 @@ int squareAt(const Layout& L, int x, int y) {
 
 // ---------------------------------------------------------------- game state
 
+// Where a legal move is shown and clicked. Castling (encoded as king takes rook) shows on the king's
+// destination in standard chess and on the rook in Chess960, where the destination can be ambiguous.
+int targetSquare(const Board& b, Move m) {
+    if (!(moveFlags(m) & MF_CASTLE) || b.variant == CHESS960) return moveTo(m);
+    return (moveFrom(m) & 56) + (moveTo(m) > moveFrom(m) ? 6 : 2);
+}
+
 bool engineToMove() { return g.gameOver.empty() && g.board.stm != g.human; }
 
 void updateGameOver() {
+    g.gameOver = g.board.variantOutcomeText();
+    if (!g.gameOver.empty()) return;
     MoveList ml;
     g.board.genLegal(ml);
-    g.gameOver.clear();
     if (!ml.count) {
         if (g.board.inCheck())
             g.gameOver = std::string("Checkmate - ") + (g.board.stm == WHITE ? "Black" : "White") + " wins";
@@ -213,8 +221,8 @@ void startEngine() {
     g.engineStop = false;
     unsigned gen = ++g.engineGen;
     Board copy = g.board;
-    int ms = THINK_TIMES[g.thinkIndex];
-    int threads = THREAD_COUNTS[g.threadIndex];
+    const EngineLevel lv = LEVELS[g.level];
+    const int threads = defaultThreads();
     bool engineWhite = g.board.stm == WHITE;
     HWND hwnd = g.hwnd;
     {
@@ -224,7 +232,7 @@ void startEngine() {
         g.tbNote.clear();
     }
     g.engine = std::thread([=] {
-        Move m = findBestMove(copy, ms, &g.engineStop, [&](const SearchInfo& si) {
+        Move m = findBestMove(copy, lv.ms, &g.engineStop, [&](const SearchInfo& si) {
             int whiteScore = engineWhite ? si.score : -si.score;
             char buf[160];
             if (si.note == "Opening book") {
@@ -241,7 +249,7 @@ void startEngine() {
             g.pvLine = si.pv;
             g.tbNote = si.note;
             PostMessage(hwnd, WM_REFRESH, 0, 0);
-        }, true, threads);
+        }, lv.book, threads, lv.nodes, lv.noise);
         PostMessage(hwnd, WM_ENGINE_DONE, gen, LPARAM(m));
     });
 }
@@ -272,7 +280,13 @@ void resetHistory() {
 void newGame(Color human) {
     stopEngine();
     clearSearchMemory();
-    g.board.setStartPos();
+    g.board.variant = g.variant;
+    if (g.variant == CHESS960) {
+        static std::mt19937 rng(std::random_device{}());
+        g.board.setFEN(chess960StartFEN(int(rng() % 960)));
+    } else {
+        g.board.setStartPos();
+    }
     g.human = human;
     g.flipped = human == BLACK;
     resetHistory();
@@ -322,8 +336,10 @@ void pasteFEN() {
     }
     CloseClipboard();
     Board b;
+    b.variant = g.variant;
     if (!b.setFEN(text)) {
-        MessageBoxW(g.hwnd, L"The clipboard does not contain a valid FEN.", L"Paste FEN", MB_ICONWARNING);
+        std::wstring msg = L"The clipboard does not contain a valid " + widen(variantName(g.variant)) + L" FEN.";
+        MessageBoxW(g.hwnd, msg.c_str(), L"Paste FEN", MB_ICONWARNING);
         return;
     }
     stopEngine();
@@ -343,8 +359,18 @@ void selectSquare(int s) {
     MoveList ml;
     g.board.genLegal(ml);
     for (int i = 0; i < ml.count; i++)
-        if (moveFrom(ml.moves[i]) == s) g.targets.push_back(ml.moves[i]);
+        if (moveFrom(ml.moves[i]) == s && !isDrop(ml.moves[i])) g.targets.push_back(ml.moves[i]);
     if (!g.targets.empty()) g.selected = s;
+}
+
+void selectHandPiece(int type) {
+    g.selected = -1;
+    g.targets.clear();
+    MoveList ml;
+    g.board.genLegal(ml);
+    for (int i = 0; i < ml.count; i++)
+        if (isDrop(ml.moves[i]) && dropType(ml.moves[i]) == type) g.targets.push_back(ml.moves[i]);
+    if (!g.targets.empty()) g.selected = 64 + type;
 }
 
 Move choosePromotion(const std::vector<Move>& options) {
@@ -362,13 +388,24 @@ Move choosePromotion(const std::vector<Move>& options) {
 
 void onClick(int x, int y) {
     if (!g.gameOver.empty() || g.engineBusy || g.board.stm != g.human) return;
+    for (auto& hr : g.handRects) {
+        POINT pt = {x, y};
+        if (PtInRect(&hr.first, pt)) {
+            if (g.selected == 64 + hr.second)
+                g.selected = -1, g.targets.clear();
+            else
+                selectHandPiece(hr.second);
+            InvalidateRect(g.hwnd, nullptr, FALSE);
+            return;
+        }
+    }
     Layout L = layout();
     int s = squareAt(L, x, y);
     if (s < 0) return;
     if (g.selected >= 0) {
         std::vector<Move> options;
         for (Move m : g.targets)
-            if (moveTo(m) == s) options.push_back(m);
+            if (targetSquare(g.board, m) == s) options.push_back(m);
         if (!options.empty()) {
             Move m = options.size() > 1 ? choosePromotion(options) : options[0];
             if (m) {
@@ -409,6 +446,9 @@ void paintBoard(HDC dc, const Layout& L) {
         COLORREF c = light ? C_LIGHT : C_DARK;
         if (last && (s == moveFrom(last) || s == moveTo(last))) c = light ? C_LAST_LIGHT : C_LAST_DARK;
         if (s == g.selected) c = C_SELECT;
+        // King of the hill: tint the four center squares the kings race for.
+        if (g.variant == KING_OF_THE_HILL && (bit(s) & CENTER) && c != C_SELECT)
+            c = RGB(GetRValue(c) * 7 / 8 + 24, GetGValue(c) * 7 / 8, GetBValue(c) * 7 / 8);
         fillRect(dc, r, c);
     }
 
@@ -461,9 +501,10 @@ void paintBoard(HDC dc, const Layout& L) {
     // Legal destination hints: translucent dots, and a ring around capturable pieces.
     Gdiplus::SolidBrush hint(Gdiplus::Color(128, 20, 85, 30));
     for (Move m : g.targets) {
-        RECT r = squareRect(L, moveTo(m));
+        int t = targetSquare(g.board, m);
+        RECT r = squareRect(L, t);
         Gdiplus::REAL cx = (r.left + r.right) / 2.0f, cy = (r.top + r.bottom) / 2.0f;
-        if (g.board.sq[moveTo(m)] || (moveFlags(m) & MF_EP)) {
+        if (g.board.sq[t] || (moveFlags(m) & MF_EP)) {
             Gdiplus::REAL w = L.sq * 0.09f, rad = L.sq / 2.0f - w / 2;
             Gdiplus::Pen ring(Gdiplus::Color(110, 20, 85, 30), w);
             gr.DrawEllipse(&ring, cx - rad, cy - rad, 2 * rad, 2 * rad);
@@ -501,11 +542,13 @@ void paintPanel(HDC dc, const Layout& L) {
     };
     HGDIOBJ old = SelectObject(dc, title);
 
-    line(title, "ChessBot", C_PANEL_TEXT, S(36));
+    line(title, g.variant == STANDARD ? "ChessBot" : std::string("ChessBot - ") + variantName(g.variant),
+         C_PANEL_TEXT, S(36));
+    const EngineLevel& lv = LEVELS[g.level];
     std::string sides = std::string("You: ") + (g.human == WHITE ? "White" : "Black") +
-                        "    Engine: " + (g.human == WHITE ? "Black" : "White") + "    (" +
-                        std::to_string(THINK_TIMES[g.thinkIndex] / 1000) + "s, " +
-                        std::to_string(THREAD_COUNTS[g.threadIndex]) + " threads)";
+                        "    Engine: " + (g.human == WHITE ? "Black" : "White") + "    (" + lv.name +
+                        (lv.nodes ? std::string() : ", " + std::to_string(lv.ms / 1000) + "s, " +
+                                             std::to_string(defaultThreads()) + " threads") + ")";
     line(normal, sides, C_DIM_TEXT, S(24));
     y += S(10);
 
@@ -521,6 +564,44 @@ void paintPanel(HDC dc, const Layout& L) {
         status = "Engine to move";
     line(bold, status, statusColor, S(26));
     y += S(8);
+
+    if (g.variant == THREE_CHECK) {
+        std::string checks = "Checks given: White " + std::to_string(g.board.checks[WHITE]) + " / 3,  Black " +
+                             std::to_string(g.board.checks[BLACK]) + " / 3";
+        line(normal, checks, C_PANEL_TEXT, S(24));
+    }
+    g.handRects.clear();
+    if (g.variant == CRAZYHOUSE) {
+        // Engine's hand first, then yours; click one of your pieces, then an empty square to drop it.
+        Gdiplus::Graphics gr(dc);
+        gr.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        const int icon = S(34);
+        for (int side : {int(g.human ^ 1), int(g.human)}) {
+            line(normal, side == g.human ? "Your hand" : "Engine's hand", C_DIM_TEXT, S(20));
+            int px = x;
+            bool any = false;
+            for (int t = QUEEN; t >= PAWN; t--) {
+                int n = g.board.pocket[side][t];
+                if (!n) continue;
+                any = true;
+                RECT r = {px, y, px + icon, y + icon};
+                if (side == g.human) {
+                    if (g.selected == 64 + t) fillRect(dc, r, C_SELECT);
+                    g.handRects.push_back({r, t});
+                }
+                if (auto& img = g_pieceSrc[makePiece(side, t)]) gr.DrawImage(img.get(), px, y, icon, icon);
+                if (n > 1) {
+                    RECT nr = {px + icon - S(4), y + icon - S(16), px + icon + S(14), y + icon};
+                    SelectObject(dc, bold);
+                    drawText(dc, std::to_wstring(n), nr, C_ACCENT, DT_LEFT | DT_SINGLELINE);
+                }
+                px += icon + S(16);
+            }
+            y += any ? icon + S(4) : 0;
+            if (!any) line(normal, "(empty)", C_DIM_TEXT, S(20));
+        }
+        y += S(6);
+    }
 
     if (!engineLine.empty()) line(normal, engineLine, C_PANEL_TEXT, S(22));
     if (!tbNote.empty()) line(normal, tbNote, C_ACCENT, S(22));
@@ -579,11 +660,11 @@ void paint(HWND hwnd) {
 
 // ---------------------------------------------------------------- window
 
-void updateTimeMenu() {
+void updateMenuChecks() {
     HMENU menu = GetMenu(g.hwnd);
-    int n = int(sizeof(THINK_TIMES) / sizeof(THINK_TIMES[0]));
-    CheckMenuRadioItem(menu, ID_TIME_BASE, ID_TIME_BASE + n - 1, ID_TIME_BASE + g.thinkIndex, MF_BYCOMMAND);
-    CheckMenuRadioItem(menu, ID_THREADS_BASE, ID_THREADS_BASE + 3, ID_THREADS_BASE + g.threadIndex, MF_BYCOMMAND);
+    CheckMenuRadioItem(menu, ID_LEVEL_BASE, ID_LEVEL_BASE + NUM_LEVELS - 1, ID_LEVEL_BASE + g.level, MF_BYCOMMAND);
+    CheckMenuRadioItem(menu, ID_VARIANT_BASE, ID_VARIANT_BASE + NUM_VARIANTS - 1, ID_VARIANT_BASE + g.variant,
+                       MF_BYCOMMAND);
 }
 
 HMENU buildMenu() {
@@ -605,13 +686,23 @@ HMENU buildMenu() {
     AppendMenuW(eng, MF_STRING, ID_SWITCH_SIDES, L"&Switch Sides\tCtrl+E");
     AppendMenuW(eng, MF_STRING, ID_MOVE_NOW, L"&Move Now\tSpace");
     AppendMenuW(eng, MF_SEPARATOR, 0, nullptr);
-    const wchar_t* labels[] = {L"Think 1 second", L"Think 3 seconds", L"Think 5 seconds", L"Think 10 seconds",
-                               L"Think 30 seconds"};
-    for (int i = 0; i < 5; i++) AppendMenuW(eng, MF_STRING, ID_TIME_BASE + i, labels[i]);
-    AppendMenuW(eng, MF_SEPARATOR, 0, nullptr);
-    const wchar_t* threadLabels[] = {L"1 thread", L"2 threads", L"4 threads", L"8 threads"};
-    for (int i = 0; i < 4; i++) AppendMenuW(eng, MF_STRING, ID_THREADS_BASE + i, threadLabels[i]);
     AppendMenuW(bar, MF_POPUP, UINT_PTR(eng), L"&Engine");
+
+    // Each level shows its approximate strength relative to Level 6 (see the README).
+    HMENU lvl = CreatePopupMenu();
+    for (int i = 0; i < NUM_LEVELS; i++) {
+        const EngineLevel& lv = LEVELS[i];
+        std::string elo = i == 5 ? std::string("reference (3 s)")
+                                 : (lv.elo > 0 ? "+" : "") + std::to_string(lv.elo) + " Elo" +
+                                       (lv.nodes ? "" : " (30 s)");
+        AppendMenuW(lvl, MF_STRING, ID_LEVEL_BASE + i, widen(std::string(lv.name) + "\t" + elo).c_str());
+    }
+    AppendMenuW(bar, MF_POPUP, UINT_PTR(lvl), L"&Level");
+
+    HMENU var = CreatePopupMenu();
+    for (int v = 0; v < NUM_VARIANTS; v++)
+        AppendMenuW(var, MF_STRING, ID_VARIANT_BASE + v, widen(variantName(v)).c_str());
+    AppendMenuW(bar, MF_POPUP, UINT_PTR(var), L"&Variant");
     return bar;
 }
 
@@ -635,14 +726,14 @@ void onCommand(int id) {
             break;
         case ID_MOVE_NOW: g.engineStop = true; break;
         default:
-            if (id >= ID_THREADS_BASE && id < ID_THREADS_BASE + 4) {
-                g.threadIndex = id - ID_THREADS_BASE;
-                updateTimeMenu();
-                InvalidateRect(g.hwnd, nullptr, FALSE);
+            if (id >= ID_VARIANT_BASE && id < ID_VARIANT_BASE + NUM_VARIANTS) {
+                g.variant = Variant(id - ID_VARIANT_BASE);
+                updateMenuChecks();
+                newGame(WHITE);
             }
-            if (id >= ID_TIME_BASE && id < ID_TIME_BASE + 5) {
-                g.thinkIndex = id - ID_TIME_BASE;
-                updateTimeMenu();
+            if (id >= ID_LEVEL_BASE && id < ID_LEVEL_BASE + NUM_LEVELS) {
+                g.level = id - ID_LEVEL_BASE;
+                updateMenuChecks();
                 InvalidateRect(g.hwnd, nullptr, FALSE);
             }
     }
@@ -726,7 +817,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
 
     g.hwnd = CreateWindowW(wc.lpszClassName, L"ChessBot", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                            S(1120), S(800), nullptr, buildMenu(), inst, nullptr);
-    updateTimeMenu();
+    updateMenuChecks();
 
     book::load(exeDir() + "\\book.bin");
 

@@ -1,6 +1,9 @@
 #include "board.h"
 
+#include <algorithm>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 
@@ -9,9 +12,17 @@ namespace {
 Bitboard PAWN_ATT[2][64], KNIGHT_ATT[64], KING_ATT[64];
 Bitboard RAY[8][64];  // N, E, NE, NW (increasing), S, W, SE, SW (decreasing)
 Bitboard LINES[64];   // all eight rays from a square on an empty board
-int castleMask[64];
-
+// Drawn after the original keys so standard-chess hashes (and the opening book) are unchanged.
 uint64_t Z_piece[16][64], Z_side, Z_castle[16], Z_ep[8];
+uint64_t Z_checks[2][8], Z_pocket[2][7][32];
+
+// Squares from a to b inclusive, both on the same rank.
+Bitboard rankSpan(int a, int b) {
+    if (a > b) std::swap(a, b);
+    Bitboard r = 0;
+    for (int s = a; s <= b; s++) r |= bit(s);
+    return r;
+}
 
 uint64_t splitmix(uint64_t& x) {
     uint64_t z = (x += 0x9E3779B97F4A7C15ULL);
@@ -76,14 +87,7 @@ void initTables() {
                 RAY[d][s] |= bit(nr * 8 + nf);
             LINES[s] |= RAY[d][s];
         }
-        castleMask[s] = 15;
     }
-    castleMask[0] = 15 & ~2;
-    castleMask[7] = 15 & ~1;
-    castleMask[4] = 15 & ~3;
-    castleMask[56] = 15 & ~8;
-    castleMask[63] = 15 & ~4;
-    castleMask[60] = 15 & ~12;
 
     uint64_t seed = 0xC0FFEE1234ULL;
     for (auto& row : Z_piece)
@@ -91,6 +95,68 @@ void initTables() {
     Z_side = splitmix(seed);
     for (auto& z : Z_castle) z = splitmix(seed);
     for (auto& z : Z_ep) z = splitmix(seed);
+    for (auto& row : Z_checks)
+        for (auto& z : row) z = splitmix(seed);
+    for (auto& side : Z_pocket)
+        for (auto& row : side)
+            for (auto& z : row) z = splitmix(seed);
+}
+
+const char* variantName(int v) {
+    static const char* N[] = {"Standard", "Chess960", "Three-check", "Crazyhouse", "King of the Hill", "Horde"};
+    return v >= 0 && v < NUM_VARIANTS ? N[v] : "?";
+}
+
+const char* variantUciName(int v) {
+    static const char* N[] = {"chess", "chess960", "3check", "crazyhouse", "kingofthehill", "horde"};
+    return v >= 0 && v < NUM_VARIANTS ? N[v] : "?";
+}
+
+int variantFromUciName(const std::string& s) {
+    std::string l;
+    for (char c : s) l += char(std::tolower((unsigned char)c));
+    for (int v = 0; v < NUM_VARIANTS; v++)
+        if (l == variantUciName(v)) return v;
+    if (l == "standard" || l == "normal") return STANDARD;
+    if (l == "threecheck" || l == "three-check") return THREE_CHECK;
+    if (l == "koth" || l == "king of the hill") return KING_OF_THE_HILL;
+    return -1;
+}
+
+std::string variantStartFEN(int v) {
+    switch (v) {
+        case THREE_CHECK: return "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 3+3 0 1";
+        case CRAZYHOUSE: return "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1";
+        case HORDE: return "rnbqkbnr/pppppppp/8/1PP2PP1/PPPPPPPP/PPPPPPPP/PPPPPPPP/PPPPPPPP w kq - 0 1";
+        default: return "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+    }
+}
+
+std::string chess960StartFEN(int n) {
+    n = ((n % 960) + 960) % 960;
+    char rank[8] = {0};
+    auto placeOnFree = [&](int index, char piece) {
+        for (int f = 0; f < 8; f++)
+            if (!rank[f] && index-- == 0) {
+                rank[f] = piece;
+                return;
+            }
+    };
+    rank[(n % 4) * 2 + 1] = 'b';  // light-squared bishop
+    n /= 4;
+    rank[(n % 4) * 2] = 'b';      // dark-squared bishop
+    n /= 4;
+    placeOnFree(n % 6, 'q');
+    n /= 6;
+    static const int KN[10][2] = {{0, 1}, {0, 2}, {0, 3}, {0, 4}, {1, 2}, {1, 3}, {1, 4}, {2, 3}, {2, 4}, {3, 4}};
+    placeOnFree(KN[n][1], 'n');  // higher index first so the lower one still counts the same free squares
+    placeOnFree(KN[n][0], 'n');
+    placeOnFree(0, 'r');
+    placeOnFree(0, 'k');
+    placeOnFree(0, 'r');
+    std::string black(rank, 8), white = black;
+    for (char& c : white) c = char(std::toupper((unsigned char)c));
+    return black + "/pppppppp/8/8/8/8/PPPPPPPP/" + white + " w KQkq - 0 1";
 }
 
 std::string squareName(int s) {
@@ -118,6 +184,11 @@ void Board::clear() {
     kingSq[0] = kingSq[1] = -1;
     pieceCount = 0;
     checkCache = -1;
+    checks[0] = checks[1] = 0;
+    std::memset(pocket, 0, sizeof(pocket));
+    promoted = 0;
+    castleRook[0] = 7, castleRook[1] = 0, castleRook[2] = 63, castleRook[3] = 56;
+    std::memset(castleMask, 15, sizeof(castleMask));
     undoStack.clear();
     hashHistory.clear();
 }
@@ -159,21 +230,70 @@ uint64_t Board::computeHash() const {
     if (stm == BLACK) h ^= Z_side;
     h ^= Z_castle[castle];
     if (ep >= 0) h ^= Z_ep[fileOf(ep)];
+    if (variant == THREE_CHECK) h ^= Z_checks[0][checks[0]] ^ Z_checks[1][checks[1]];
+    if (variant == CRAZYHOUSE)
+        for (int c = 0; c < 2; c++)
+            for (int t = PAWN; t <= QUEEN; t++) h ^= Z_pocket[c][t][pocket[c][t]];
     return h;
 }
 
-void Board::setStartPos() { setFEN("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"); }
+void Board::changePocket(int c, int t, int delta) {
+    hash ^= Z_pocket[c][t][pocket[c][t]];
+    pocket[c][t] += delta;
+    hash ^= Z_pocket[c][t][pocket[c][t]];
+}
 
-bool Board::setFEN(const std::string& fen) {
+void Board::setStartPos() { setFEN(variantStartFEN(variant)); }
+
+bool Board::setFEN(const std::string& fenIn) {
     clear();
-    std::istringstream ss(fen);
+    std::istringstream ss(fenIn);
     std::string pos, side, cas = "-", eps = "-";
     if (!(ss >> pos >> side)) return false;
     ss >> cas >> eps;
-    int hm = 0, fm = 1;
-    if (!(ss >> hm)) hm = 0;
-    if (!(ss >> fm)) fm = 1;
+    std::vector<std::string> rest;
+    for (std::string t; ss >> t;) rest.push_back(t);
+    // Three-check counters: "3+3" before the clocks (checks remaining) or "+1+0" after them (checks given).
+    for (size_t i = 0; i < rest.size(); i++) {
+        const std::string& t = rest[i];
+        int a, b;
+        if (t.size() >= 4 && t[0] == '+' && std::sscanf(t.c_str(), "+%d+%d", &a, &b) == 2) {
+            checks[WHITE] = a, checks[BLACK] = b;
+        } else if (t.find('+') != std::string::npos && std::sscanf(t.c_str(), "%d+%d", &a, &b) == 2) {
+            checks[WHITE] = 3 - a, checks[BLACK] = 3 - b;
+        } else {
+            continue;
+        }
+        rest.erase(rest.begin() + i--);
+    }
+    for (int& c : checks) c = std::max(0, std::min(c, 3));
+    int hm = rest.size() > 0 ? std::atoi(rest[0].c_str()) : 0;
+    int fm = rest.size() > 1 ? std::atoi(rest[1].c_str()) : 1;
 
+    // Crazyhouse hands: "board[Qn]" or a ninth "rank" after the eighth slash.
+    std::string hand;
+    size_t br = pos.find('[');
+    if (br != std::string::npos) {
+        size_t end = pos.find(']', br);
+        hand = pos.substr(br + 1, end == std::string::npos ? std::string::npos : end - br - 1);
+        pos = pos.substr(0, br);
+    } else if (std::count(pos.begin(), pos.end(), '/') == 8) {
+        size_t last = pos.rfind('/');
+        hand = pos.substr(last + 1);
+        pos = pos.substr(0, last);
+    }
+
+    auto typeFor = [](char c) {
+        switch (std::tolower((unsigned char)c)) {
+            case 'p': return int(PAWN);
+            case 'n': return int(KNIGHT);
+            case 'b': return int(BISHOP);
+            case 'r': return int(ROOK);
+            case 'q': return int(QUEEN);
+            case 'k': return int(KING);
+            default: return 0;
+        }
+    };
     int r = 7, f = 0;
     int kings[2] = {0, 0};
     for (char c : pos) {
@@ -186,39 +306,60 @@ bool Board::setFEN(const std::string& fen) {
             f += c - '0';
             continue;
         }
-        int t;
-        switch (std::tolower((unsigned char)c)) {
-            case 'p': t = PAWN; break;
-            case 'n': t = KNIGHT; break;
-            case 'b': t = BISHOP; break;
-            case 'r': t = ROOK; break;
-            case 'q': t = QUEEN; break;
-            case 'k': t = KING; break;
-            default: return false;
+        if (c == '~') {  // the piece just placed is promoted
+            if (f > 0 && r >= 0) promoted |= bit(r * 8 + f - 1);
+            continue;
         }
-        if (r < 0 || f > 7) return false;
+        int t = typeFor(c);
+        if (!t || r < 0 || f > 7) return false;
         int c2 = std::isupper((unsigned char)c) ? WHITE : BLACK;
         if (t == KING) kings[c2]++;
         put(r * 8 + f, makePiece(c2, t));
         f++;
     }
-    if (kings[0] != 1 || kings[1] != 1) return false;
+    for (char c : hand) {
+        int t = typeFor(c);
+        if (t && t != KING) pocket[std::isupper((unsigned char)c) ? WHITE : BLACK][t]++;
+    }
+    if (variant != CRAZYHOUSE) std::memset(pocket, 0, sizeof(pocket)), promoted = 0;
+    if (variant != THREE_CHECK) checks[0] = checks[1] = 0;
+    if (kings[BLACK] != 1 || kings[WHITE] != (variant == HORDE ? 0 : 1)) return false;
     if (side != "w" && side != "b") return false;
     stm = side == "b" ? BLACK : WHITE;
     checkCache = -1;
 
+    // Castling: KQkq picks the outermost rook on that side of the king; A-H / a-h name the rook's file.
     for (char c : cas) {
-        if (c == 'K' && sq[4] == makePiece(WHITE, KING) && sq[7] == makePiece(WHITE, ROOK)) castle |= 1;
-        if (c == 'Q' && sq[4] == makePiece(WHITE, KING) && sq[0] == makePiece(WHITE, ROOK)) castle |= 2;
-        if (c == 'k' && sq[60] == makePiece(BLACK, KING) && sq[63] == makePiece(BLACK, ROOK)) castle |= 4;
-        if (c == 'q' && sq[60] == makePiece(BLACK, KING) && sq[56] == makePiece(BLACK, ROOK)) castle |= 8;
+        int color = std::isupper((unsigned char)c) ? WHITE : BLACK;
+        int k = kingSq[color], base = color == WHITE ? 0 : 56;
+        if (k < 0 || rankOf(k) != rankOf(base)) continue;
+        int rook = makePiece(color, ROOK), rookSq = -1;
+        char l = char(std::tolower((unsigned char)c));
+        if (l == 'k') {
+            for (int s = base + 7; s > k && rookSq < 0; s--)
+                if (sq[s] == rook) rookSq = s;
+        } else if (l == 'q') {
+            for (int s = base; s < k && rookSq < 0; s++)
+                if (sq[s] == rook) rookSq = s;
+        } else if (l >= 'a' && l <= 'h' && sq[base + (l - 'a')] == rook) {
+            rookSq = base + (l - 'a');
+        }
+        if (rookSq < 0) continue;
+        int right = color * 2 + (rookSq > k ? 0 : 1);
+        castle |= 1 << right;
+        castleRook[right] = rookSq;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (!(castle & (1 << i))) continue;
+        castleMask[castleRook[i]] &= uint8_t(~(1 << i));
+        castleMask[kingSq[i / 2]] &= uint8_t(~(3 << (i / 2 * 2)));
     }
     if (eps.size() == 2 && eps[0] >= 'a' && eps[0] <= 'h' && eps[1] >= '1' && eps[1] <= '8')
         ep = (eps[1] - '1') * 8 + (eps[0] - 'a');
-    halfmove = hm;
+    halfmove = std::max(0, hm);
     fullmove = fm < 1 ? 1 : fm;
     // The side not to move must not be in check.
-    if (attacked(kingSq[stm ^ 1], stm)) return false;
+    if (kingSq[stm ^ 1] >= 0 && attacked(kingSq[stm ^ 1], stm)) return false;
     hash = computeHash();
     return true;
 }
@@ -236,18 +377,32 @@ std::string Board::getFEN() const {
             }
             if (empty) s += char('0' + empty), empty = 0;
             s += PC[p];
+            if (promoted & bit(r * 8 + f)) s += '~';
         }
         if (empty) s += char('0' + empty);
         if (r) s += '/';
     }
+    if (variant == CRAZYHOUSE) {
+        s += '[';
+        for (int c = 0; c < 2; c++)
+            for (int t = QUEEN; t >= PAWN; t--) s += std::string(pocket[c][t], PC[makePiece(c, t)]);
+        s += ']';
+    }
     s += stm == WHITE ? " w " : " b ";
     if (!castle) s += '-';
-    if (castle & 1) s += 'K';
-    if (castle & 2) s += 'Q';
-    if (castle & 4) s += 'k';
-    if (castle & 8) s += 'q';
+    for (int i = 0; i < 4; i++) {
+        if (!(castle & (1 << i))) continue;
+        int color = i / 2, rookSq = castleRook[i];
+        // Use KQkq when the castling rook is the outermost one (X-FEN), else the rook's file.
+        bool outermost = true;
+        for (int t = rookSq & 56; t < (rookSq & 56) + 8; t++)
+            if (sq[t] == makePiece(color, ROOK) && (i % 2 == 0 ? t > rookSq : t < rookSq)) outermost = false;
+        char c = outermost ? "KQkq"[i] : char('a' + fileOf(rookSq));
+        s += color == WHITE ? char(std::toupper((unsigned char)c)) : c;
+    }
     s += ' ';
     s += ep >= 0 ? squareName(ep) : "-";
+    if (variant == THREE_CHECK) s += ' ' + std::to_string(3 - checks[WHITE]) + '+' + std::to_string(3 - checks[BLACK]);
     s += ' ' + std::to_string(halfmove) + ' ' + std::to_string(fullmove);
     return s;
 }
@@ -262,6 +417,7 @@ Bitboard Board::attackersTo(int s, Bitboard o) const {
 }
 
 bool Board::attacked(int s, int by) const {
+    if (s < 0) return false;
     if (PAWN_ATT[by ^ 1][s] & pieces[by][PAWN]) return true;
     if (KNIGHT_ATT[s] & pieces[by][KNIGHT]) return true;
     if (KING_ATT[s] & pieces[by][KING]) return true;
@@ -301,6 +457,13 @@ void Board::genMoves(MoveList& ml, bool capturesOnly) const {
             int to = popLsb(b);
             ml.add(encodeMove(to - 2 * up, to, 0, MF_DOUBLE));
         }
+        // Horde: White's pawns on the first rank may also advance two squares, but (as on lichess)
+        // that step cannot be taken en passant, so it is not flagged as a double push.
+        if (variant == HORDE && us == WHITE)
+            for (Bitboard b = shift(push1 & rankMask(1)) & empty; b;) {
+                int to = popLsb(b);
+                ml.add(encodeMove(to - 16, to));
+            }
     }
     for (Bitboard b = pawns; b;) {
         int from = popLsb(b);
@@ -335,30 +498,37 @@ void Board::genMoves(MoveList& ml, bool capturesOnly) const {
         }
     }
 
-    // Castling
-    if (!capturesOnly && castle) {
-        if (us == WHITE && kingSq[us] == 4) {
-            if ((castle & 1) && !(occAll & 0x60ULL) && !attacked(4, BLACK) && !attacked(5, BLACK) &&
-                !attacked(6, BLACK))
-                ml.add(encodeMove(4, 6, 0, MF_CASTLE));
-            if ((castle & 2) && !(occAll & 0x0EULL) && !attacked(4, BLACK) && !attacked(3, BLACK) &&
-                !attacked(2, BLACK))
-                ml.add(encodeMove(4, 2, 0, MF_CASTLE));
-        } else if (us == BLACK && kingSq[us] == 60) {
-            if ((castle & 4) && !(occAll & (0x60ULL << 56)) && !attacked(60, WHITE) && !attacked(61, WHITE) &&
-                !attacked(62, WHITE))
-                ml.add(encodeMove(60, 62, 0, MF_CASTLE));
-            if ((castle & 8) && !(occAll & (0x0EULL << 56)) && !attacked(60, WHITE) && !attacked(59, WHITE) &&
-                !attacked(58, WHITE))
-                ml.add(encodeMove(60, 58, 0, MF_CASTLE));
+    // Castling (also Chess960): the king goes to the g- or c-file and the rook next to it. Every square
+    // either piece crosses must be empty apart from those two, and the king may not pass through check.
+    if (!capturesOnly && (castle & (us == WHITE ? 3 : 12))) {
+        const int k = kingSq[us], base = us == WHITE ? 0 : 56;
+        for (int right = us * 2; right < us * 2 + 2; right++) {
+            if (!(castle & (1 << right))) continue;
+            const bool kingSide = right % 2 == 0;
+            const int rf = castleRook[right], kt = base + (kingSide ? 6 : 2), rt = base + (kingSide ? 5 : 3);
+            if ((rankSpan(k, kt) | rankSpan(rf, rt)) & occAll & ~bit(k) & ~bit(rf)) continue;
+            bool safe = true;
+            for (Bitboard path = rankSpan(k, kt); path && safe;)
+                if (attacked(popLsb(path), them)) safe = false;
+            if (safe) ml.add(encodeMove(k, rf, 0, MF_CASTLE));
+        }
+    }
+
+    // Crazyhouse drops: any piece in hand onto an empty square, pawns not on the first or last rank.
+    if (!capturesOnly && variant == CRAZYHOUSE) {
+        for (int t = PAWN; t <= QUEEN; t++) {
+            if (!pocket[us][t]) continue;
+            Bitboard to = empty & (t == PAWN ? ~(rankMask(0) | rankMask(7)) : ~Bitboard(0));
+            while (to) ml.add(encodeDrop(popLsb(to), t));
         }
     }
 }
 
 void Board::genLegal(MoveList& ml) {
+    ml.count = 0;
+    if (variantOutcome()) return;  // the game is already over
     MoveList pseudo;
     genMoves(pseudo);
-    ml.count = 0;
     for (int i = 0; i < pseudo.count; i++)
         if (makeMove(pseudo.moves[i])) {
             unmakeMove();
@@ -366,47 +536,69 @@ void Board::genLegal(MoveList& ml) {
         }
 }
 
-static void rookCastleSquares(int kingTo, int& rf, int& rt) {
-    switch (kingTo) {
-        case 6: rf = 7, rt = 5; break;
-        case 2: rf = 0, rt = 3; break;
-        case 62: rf = 63, rt = 61; break;
-        default: rf = 56, rt = 59; break;
-    }
+void Board::castleSquares(Move m, int& kingTo, int& rookFrom, int& rookTo) const {
+    int from = moveFrom(m), base = from & 56;
+    rookFrom = moveTo(m);
+    bool kingSide = rookFrom > from;
+    kingTo = base + (kingSide ? 6 : 2);
+    rookTo = base + (kingSide ? 5 : 3);
 }
 
 bool Board::makeMove(Move m) {
-    int from = moveFrom(m), to = moveTo(m);
-    uint32_t flags = moveFlags(m);
-    int p = sq[from];
-    int capSq = (flags & MF_EP) ? to + (stm == WHITE ? -8 : 8) : to;
-    int cap = sq[capSq];
+    const int from = moveFrom(m), to = moveTo(m);
+    const uint32_t flags = moveFlags(m);
+    const bool drop = isDrop(m), castling = (flags & MF_CASTLE) != 0;
+    const int p = drop ? makePiece(stm, dropType(m)) : sq[from];
+    const int capSq = (flags & MF_EP) ? to + (stm == WHITE ? -8 : 8) : to;
+    const int cap = drop || castling ? EMPTY : sq[capSq];
     // A move can only expose our king if we are in check, the king moves, it is en passant,
-    // or the moving piece sits on a line through our king (a potential pin).
-    bool mustTest = inCheck() || typeOf(p) == KING || (flags & MF_EP) || (LINES[kingSq[stm]] & bit(from));
+    // or the moving piece sits on a line through our king (a potential pin). A drop only adds a blocker.
+    const int ks = kingSq[stm];
+    const bool mustTest = ks >= 0 && (inCheck() || typeOf(p) == KING || (flags & MF_EP) ||
+                                      (!drop && (LINES[ks] & bit(from))));
 
-    undoStack.push_back({m, cap, castle, ep, halfmove, hash, checkCache});
+    undoStack.push_back({m, cap, castle, ep, halfmove, hash, checkCache, promoted,
+                         {uint8_t(checks[0]), uint8_t(checks[1])}});
     hashHistory.push_back(hash);
 
     if (ep >= 0) hash ^= Z_ep[fileOf(ep)];
-    if (cap) {
-        hash ^= Z_piece[cap][capSq];
-        removePiece(capSq);
-        pieceCount--;
-    }
-    hash ^= Z_piece[p][from];
-    removePiece(from);
-    int np = movePromo(m) ? makePiece(stm, movePromo(m)) : p;
-    addPiece(to, np);
-    hash ^= Z_piece[np][to];
-    if (typeOf(p) == KING) kingSq[stm] = to;
-    if (flags & MF_CASTLE) {
-        int rf, rt;
-        rookCastleSquares(to, rf, rt);
+    if (drop) {
+        addPiece(to, p);
+        hash ^= Z_piece[p][to];
+        pieceCount++;
+        changePocket(stm, typeOf(p), -1);
+    } else if (castling) {
+        int kt, rf, rt;
+        castleSquares(m, kt, rf, rt);
         int rook = sq[rf];
+        removePiece(from);
         removePiece(rf);
+        addPiece(kt, p);
         addPiece(rt, rook);
-        hash ^= Z_piece[rook][rf] ^ Z_piece[rook][rt];
+        hash ^= Z_piece[p][from] ^ Z_piece[p][kt] ^ Z_piece[rook][rf] ^ Z_piece[rook][rt];
+        kingSq[stm] = kt;
+    } else {
+        if (cap) {
+            hash ^= Z_piece[cap][capSq];
+            removePiece(capSq);
+            pieceCount--;
+            if (variant == CRAZYHOUSE) {
+                changePocket(stm, (promoted & bit(capSq)) ? PAWN : typeOf(cap), 1);
+                promoted &= ~bit(capSq);
+            }
+        }
+        hash ^= Z_piece[p][from];
+        removePiece(from);
+        int np = movePromo(m) ? makePiece(stm, movePromo(m)) : p;
+        addPiece(to, np);
+        hash ^= Z_piece[np][to];
+        if (typeOf(p) == KING) kingSq[stm] = to;
+        if (variant == CRAZYHOUSE) {
+            if (promoted & bit(from))
+                promoted ^= bit(from) | bit(to);
+            else if (movePromo(m))
+                promoted |= bit(to);
+        }
     }
     hash ^= Z_castle[castle];
     castle &= castleMask[from] & castleMask[to];
@@ -426,6 +618,12 @@ bool Board::makeMove(Move m) {
         unmakeMove();
         return false;
     }
+    if (variant == THREE_CHECK && inCheck()) {
+        int mover = stm ^ 1;
+        hash ^= Z_checks[mover][checks[mover]];
+        checks[mover] = std::min(checks[mover] + 1, 7);
+        hash ^= Z_checks[mover][checks[mover]];
+    }
     return true;
 }
 
@@ -438,31 +636,44 @@ void Board::unmakeMove() {
     Move m = u.move;
     int from = moveFrom(m), to = moveTo(m);
     uint32_t flags = moveFlags(m);
-    int p = movePromo(m) ? makePiece(stm, PAWN) : sq[to];
-    removePiece(to);
-    addPiece(from, p);
-    if (typeOf(p) == KING) kingSq[stm] = from;
-    if (flags & MF_CASTLE) {
-        int rf, rt;
-        rookCastleSquares(to, rf, rt);
-        int rook = sq[rt];
+    if (isDrop(m)) {
+        removePiece(to);
+        pieceCount--;
+        pocket[stm][dropType(m)]++;
+    } else if (flags & MF_CASTLE) {
+        int kt, rf, rt;
+        castleSquares(m, kt, rf, rt);
+        int king = sq[kt], rook = sq[rt];
+        removePiece(kt);
         removePiece(rt);
+        addPiece(from, king);
         addPiece(rf, rook);
-    }
-    if (u.captured) {
-        int capSq = (flags & MF_EP) ? to + (stm == WHITE ? -8 : 8) : to;
-        addPiece(capSq, u.captured);
-        pieceCount++;
+        kingSq[stm] = from;
+    } else {
+        int p = movePromo(m) ? makePiece(stm, PAWN) : sq[to];
+        removePiece(to);
+        addPiece(from, p);
+        if (typeOf(p) == KING) kingSq[stm] = from;
+        if (u.captured) {
+            int capSq = (flags & MF_EP) ? to + (stm == WHITE ? -8 : 8) : to;
+            addPiece(capSq, u.captured);
+            pieceCount++;
+            if (variant == CRAZYHOUSE) pocket[stm][(u.promoted & bit(capSq)) ? PAWN : typeOf(u.captured)]--;
+        }
     }
     castle = u.castle;
     ep = u.ep;
     halfmove = u.halfmove;
     hash = u.hash;
     checkCache = u.checkCache;
+    promoted = u.promoted;
+    checks[0] = u.checks[0];
+    checks[1] = u.checks[1];
 }
 
 void Board::makeNull() {
-    undoStack.push_back({NO_MOVE, 0, castle, ep, halfmove, hash, checkCache});
+    undoStack.push_back({NO_MOVE, 0, castle, ep, halfmove, hash, checkCache, promoted,
+                         {uint8_t(checks[0]), uint8_t(checks[1])}});
     checkCache = -1;
     hashHistory.push_back(hash);
     if (ep >= 0) hash ^= Z_ep[fileOf(ep)];
@@ -483,6 +694,26 @@ void Board::unmakeNull() {
     checkCache = u.checkCache;
 }
 
+int Board::variantOutcome() const {
+    const int them = stm ^ 1;
+    switch (variant) {
+        case THREE_CHECK: return checks[them] >= 3 ? -1 : 0;
+        case KING_OF_THE_HILL: return kingSq[them] >= 0 && (bit(kingSq[them]) & CENTER) ? -1 : 0;
+        case HORDE: return occ[stm] ? 0 : -1;
+        default: return 0;
+    }
+}
+
+std::string Board::variantOutcomeText() const {
+    if (!variantOutcome()) return {};
+    std::string winner = stm == WHITE ? "Black" : "White";
+    switch (variant) {
+        case THREE_CHECK: return winner + " wins by three checks";
+        case KING_OF_THE_HILL: return winner + " wins - king reached the center";
+        default: return "Black wins - the horde is destroyed";
+    }
+}
+
 bool Board::isRepetition() const {
     int n = (int)hashHistory.size();
     int limit = halfmove < n ? halfmove : n;
@@ -501,6 +732,8 @@ int Board::repetitionCount() const {
 }
 
 bool Board::insufficientMaterial() const {
+    // Other variants: pieces come back (crazyhouse), checks or the center win, or the horde must be wiped out.
+    if (variant != STANDARD && variant != CHESS960) return false;
     for (int c = 0; c < 2; c++)
         if (pieces[c][PAWN] | pieces[c][ROOK] | pieces[c][QUEEN]) return false;
     Bitboard knights = pieces[0][KNIGHT] | pieces[1][KNIGHT];
@@ -515,7 +748,13 @@ bool Board::hasNonPawnMaterial(int c) const {
 }
 
 std::string Board::moveToUCI(Move m) const {
-    std::string s = squareName(moveFrom(m)) + squareName(moveTo(m));
+    if (isDrop(m)) return std::string(1, " PNBRQK"[dropType(m)]) + '@' + squareName(moveTo(m));
+    int to = moveTo(m);
+    if ((moveFlags(m) & MF_CASTLE) && variant != CHESS960) {
+        int rf, rt;
+        castleSquares(m, to, rf, rt);  // standard notation names the king's destination (e1g1)
+    }
+    std::string s = squareName(moveFrom(m)) + squareName(to);
     if (movePromo(m)) s += " pnbrqk"[movePromo(m)];
     return s;
 }
@@ -523,8 +762,17 @@ std::string Board::moveToUCI(Move m) const {
 Move Board::parseUCI(const std::string& str) {
     MoveList ml;
     genLegal(ml);
-    for (int i = 0; i < ml.count; i++)
-        if (moveToUCI(ml.moves[i]) == str) return ml.moves[i];
+    for (int i = 0; i < ml.count; i++) {
+        Move m = ml.moves[i];
+        if (moveToUCI(m) == str) return m;
+        // Accept both castling notations: king to its destination and king onto the rook.
+        if ((moveFlags(m) & MF_CASTLE) && squareName(moveFrom(m)) + squareName(moveTo(m)) == str) return m;
+        if (moveFlags(m) & MF_CASTLE) {
+            int kt, rf, rt;
+            castleSquares(m, kt, rf, rt);
+            if (kt != moveFrom(m) && squareName(moveFrom(m)) + squareName(kt) == str) return m;
+        }
+    }
     return NO_MOVE;
 }
 
@@ -539,8 +787,16 @@ Move Board::parseSAN(const std::string& in) {
         bool longSide = s.size() == 5;
         for (int i = 0; i < ml.count; i++) {
             Move m = ml.moves[i];
-            if ((moveFlags(m) & MF_CASTLE) && (fileOf(moveTo(m)) == 2) == longSide) return m;
+            if ((moveFlags(m) & MF_CASTLE) && (moveTo(m) < moveFrom(m)) == longSide) return m;
         }
+        return NO_MOVE;
+    }
+    size_t at = s.find('@');
+    if (at != std::string::npos && s.size() == at + 3) {  // drop: "N@f3", "P@e4" or "@e4"
+        int type = at == 0 ? int(PAWN) : int(std::string(" PNBRQK").find(s[0]));
+        int to = (s[at + 2] - '1') * 8 + (s[at + 1] - 'a');
+        for (int i = 0; i < ml.count; i++)
+            if (isDrop(ml.moves[i]) && moveTo(ml.moves[i]) == to && dropType(ml.moves[i]) == type) return ml.moves[i];
         return NO_MOVE;
     }
     if (s.size() < 2) return NO_MOVE;
@@ -564,7 +820,7 @@ Move Board::parseSAN(const std::string& in) {
         Move m = ml.moves[k];
         int from = moveFrom(m);
         if (moveTo(m) != to || typeOf(sq[from]) != type || movePromo(m) != promo) continue;
-        if (moveFlags(m) & MF_CASTLE) continue;
+        if ((moveFlags(m) & MF_CASTLE) || isDrop(m)) continue;
         if (disFile >= 0 && fileOf(from) != disFile) continue;
         if (disRank >= 0 && rankOf(from) != disRank) continue;
         return m;
@@ -575,10 +831,12 @@ Move Board::parseSAN(const std::string& in) {
 std::string Board::moveToSAN(Move m) {
     const char* LET = "  NBRQK";
     int from = moveFrom(m), to = moveTo(m);
-    int t = typeOf(sq[from]);
+    int t = isDrop(m) ? dropType(m) : typeOf(sq[from]);
     std::string s;
-    if (moveFlags(m) & MF_CASTLE) {
-        s = fileOf(to) == 6 ? "O-O" : "O-O-O";
+    if (isDrop(m)) {
+        s = std::string(1, " PNBRQK"[t]) + '@' + squareName(to);
+    } else if (moveFlags(m) & MF_CASTLE) {
+        s = to > from ? "O-O" : "O-O-O";
     } else if (t == PAWN) {
         if (isCapture(m)) {
             s += char('a' + fileOf(from));
@@ -597,7 +855,9 @@ std::string Board::moveToSAN(Move m) {
         for (int i = 0; i < ml.count; i++) {
             Move o = ml.moves[i];
             int of = moveFrom(o);
-            if (o == m || moveTo(o) != to || of == from || typeOf(sq[of]) != t) continue;
+            if (o == m || moveTo(o) != to || of == from || isDrop(o) || (moveFlags(o) & MF_CASTLE) ||
+                typeOf(sq[of]) != t)
+                continue;
             ambiguous = true;
             if (fileOf(of) == fileOf(from)) sameFile = true;
             if (rankOf(of) == rankOf(from)) sameRank = true;
@@ -617,7 +877,7 @@ std::string Board::moveToSAN(Move m) {
         if (inCheck()) {
             MoveList replies;
             genLegal(replies);
-            s += replies.count ? '+' : '#';
+            s += replies.count || variantOutcome() ? '+' : '#';
         }
         unmakeMove();
     }

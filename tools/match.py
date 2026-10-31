@@ -28,6 +28,7 @@ OPENINGS = [
 
 THREADS = {}  # engine command -> thread count
 BOOK = {}  # engine command -> use its own opening book
+OPTIONS = {}  # engine command -> extra UCI options, e.g. {"Level": 3}
 
 
 def command(cmd):
@@ -36,7 +37,8 @@ def command(cmd):
     return parts
 
 
-def play(cmd_white, cmd_black, opening, tc, movetime=0, adjudicate=False):
+def play(cmd_white, cmd_black, opening, tc, movetime=(0, 0), adjudicate=False):
+    """movetime: fixed seconds per move for (white, black); 0 uses the clock."""
     base, inc = tc
     board = chess.Board()
     for uci in opening.split():
@@ -55,18 +57,21 @@ def play(cmd_white, cmd_black, opening, tc, movetime=0, adjudicate=False):
             t = THREADS.get(cmd)
             if t and "Threads" in engines[side].options:
                 engines[side].configure({"Threads": t})
+            if OPTIONS.get(cmd):
+                engines[side].configure(OPTIONS[cmd])
         clock = {chess.WHITE: base, chess.BLACK: base}
         lopsided = 0  # consecutive plies where the mover's score is beyond +-1000 cp
         while not board.is_game_over(claim_draw=True):
             side = board.turn
-            if movetime:
-                limit = chess.engine.Limit(time=movetime)
+            mt = movetime[0] if side == chess.WHITE else movetime[1]
+            if mt:
+                limit = chess.engine.Limit(time=mt)
             else:
                 limit = chess.engine.Limit(white_clock=clock[chess.WHITE], black_clock=clock[chess.BLACK],
                                            white_inc=inc, black_inc=inc)
             t0 = time.monotonic()
             result = engines[side].play(board, limit, info=chess.engine.INFO_SCORE)
-            if not movetime:
+            if not mt:
                 clock[side] -= time.monotonic() - t0
             if adjudicate and "score" in result.info:
                 cp = result.info["score"].pov(side).score(mate_score=100000)
@@ -103,19 +108,28 @@ def main():
     ap.add_argument("--threads-a", type=int, default=0)
     ap.add_argument("--threads-b", type=int, default=0)
     ap.add_argument("--movetime", type=float, default=0, help="fixed seconds per move (overrides --tc)")
+    ap.add_argument("--movetime-a", type=float, default=0, help="fixed seconds per move for A only")
+    ap.add_argument("--movetime-b", type=float, default=0, help="fixed seconds per move for B only")
     ap.add_argument("--book-a", action="store_true", help="let engine A use its own opening book")
     ap.add_argument("--book-b", action="store_true", help="let engine B use its own opening book")
     ap.add_argument("--startpos", action="store_true", help="start every game from the initial position")
     ap.add_argument("--adjudicate", action="store_true", help="end games both engines score beyond +-10 pawns")
+    ap.add_argument("--option-a", action="append", default=[], metavar="NAME=VALUE", help="UCI option for A")
+    ap.add_argument("--option-b", action="append", default=[], metavar="NAME=VALUE", help="UCI option for B")
     args = ap.parse_args()
     base, inc = (float(x) for x in args.tc.split("+"))
-    if args.a == args.b and (args.threads_a or args.threads_b or args.book_a or args.book_b):
+    if args.a == args.b and (args.threads_a or args.threads_b or args.book_a or args.book_b or args.option_a
+                             or args.option_b or args.movetime_a or args.movetime_b):
         args.b += " "  # distinguish identical commands so each side gets its own thread count
     THREADS[args.a] = args.threads_a
     THREADS[args.b] = args.threads_b
     BOOK[args.a] = args.book_a
     BOOK[args.b] = args.book_b
+    OPTIONS[args.a] = dict(o.split("=", 1) for o in args.option_a)
+    OPTIONS[args.b] = dict(o.split("=", 1) for o in args.option_b)
 
+    mt_a = args.movetime_a or args.movetime
+    mt_b = args.movetime_b or args.movetime
     openings = OPENINGS[:]
     random.Random(1).shuffle(openings)
     jobs = []
@@ -128,7 +142,7 @@ def main():
     with cf.ThreadPoolExecutor(args.concurrency) as pool:
         futures = {
             pool.submit(play, args.a if aw else args.b, args.b if aw else args.a, op, (base, inc),
-                        args.movetime, args.adjudicate): aw
+                        (mt_a, mt_b) if aw else (mt_b, mt_a), args.adjudicate): aw
             for aw, op in jobs
         }
         for n, f in enumerate(cf.as_completed(futures), 1):

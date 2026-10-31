@@ -41,6 +41,8 @@ void uciLoop(const std::string& tbDir, const std::string& bookPath) {
     book::load(bookPath);
     bool ownBook = true;
     int threads = 1;
+    int level = 6;  // 1..6; time still comes from the "go" command
+    int levelNodes = -1, levelNoise = -1;  // calibration overrides for the level's limits (-1 = level's own)
     std::thread([] { tb::loadOrGenerateAll(nullptr); }).detach();
 
     Board board;
@@ -63,6 +65,13 @@ void uciLoop(const std::string& tbDir, const std::string& bookPath) {
             std::printf("id name ChessBot\nid author Randy\n");
             std::printf("option name OwnBook type check default true\n");
             std::printf("option name Threads type spin default 1 min 1 max 64\n");
+            std::printf("option name Level type spin default 6 min 1 max 6\n");
+            std::printf("option name LevelNodes type spin default -1 min -1 max 100000000\n");
+            std::printf("option name LevelNoise type spin default -1 min -1 max 1000\n");
+            std::printf("option name UCI_Chess960 type check default false\n");
+            std::printf("option name UCI_Variant type combo default chess");
+            for (int v = 0; v < NUM_VARIANTS; v++) std::printf(" var %s", variantUciName(v));
+            std::printf("\n");
             std::printf("uciok\n");
         } else if (cmd == "setoption") {
             std::string tok, name, value;
@@ -71,6 +80,18 @@ void uciLoop(const std::string& tbDir, const std::string& bookPath) {
             in >> value;
             if (name == "OwnBook") ownBook = value == "true";
             if (name == "Threads") threads = std::max(1, std::atoi(value.c_str()));
+            if (name == "Level") level = std::max(1, std::min(6, std::atoi(value.c_str())));
+            if (name == "LevelNodes") levelNodes = std::atoi(value.c_str());
+            if (name == "LevelNoise") levelNoise = std::atoi(value.c_str());
+            if (name == "UCI_Variant" && variantFromUciName(value) >= 0) {
+                join();
+                board.variant = Variant(variantFromUciName(value));
+                board.setStartPos();
+            }
+            if (name == "UCI_Chess960" && (board.variant == STANDARD || board.variant == CHESS960)) {
+                join();
+                board.variant = value == "true" ? CHESS960 : STANDARD;
+            }
         } else if (cmd == "isready") {
             std::printf("readyok\n");
         } else if (cmd == "ucinewgame") {
@@ -93,22 +114,28 @@ void uciLoop(const std::string& tbDir, const std::string& bookPath) {
                 else if (tok == "movestogo") in >> movestogo;
                 else if (tok == "infinite") infinite = true;
             }
-            int ms;
+            int ms, soft = 0;
             if (movetime > 0) {
                 ms = movetime;
             } else if (infinite) {
                 ms = 1 << 30;
             } else {
+                // Aim for a share of the remaining clock, and allow up to five times that (but never more
+                // than a third of the clock) when the search is unsettled.
                 int left = board.stm == WHITE ? wtime : btime;
                 int inc = board.stm == WHITE ? winc : binc;
                 if (left < 0) left = 10000;
-                int togo = movestogo > 0 ? movestogo : 30;
-                ms = left / togo + inc * 3 / 4;
-                ms = std::max(10, std::min(ms, left / 3));
+                int togo = movestogo > 0 ? std::min(movestogo, 40) : 25;
+                soft = left / togo + inc * 3 / 4;
+                ms = std::max(10, std::min(soft * 5, left / 3));
+                soft = std::max(5, std::min(soft, ms));
             }
             stop = false;
             Board copy = board;
-            worker = std::thread([copy, ms, ownBook, threads, &stop] {
+            EngineLevel lv = LEVELS[level - 1];
+            if (levelNodes >= 0) lv.nodes = levelNodes;
+            if (levelNoise >= 0) lv.noise = levelNoise;
+            worker = std::thread([copy, ms, soft, ownBook, threads, lv, &stop] {
                 Move m = findBestMove(copy, ms, &stop, [](const SearchInfo& si) {
                     std::printf("info depth %d score %s nodes %llu time %d\n", si.depth,
                                 si.score > MATE_BOUND    ? ("mate " + std::to_string((MATE - si.score + 1) / 2)).c_str()
@@ -116,7 +143,7 @@ void uciLoop(const std::string& tbDir, const std::string& bookPath) {
                                                          : ("cp " + std::to_string(si.score)).c_str(),
                                 (unsigned long long)si.nodes, si.ms);
                     std::fflush(stdout);
-                }, ownBook, threads);
+                }, ownBook && lv.book, threads, lv.nodes, lv.noise, soft);
                 std::printf("bestmove %s\n", m ? copy.moveToUCI(m).c_str() : "0000");
                 std::fflush(stdout);
             });
