@@ -6,6 +6,7 @@
 # measured hot paths. Same source, same search, faster. Otherwise it is a plain build.
 set -e
 src=$1; out=$2; shift 2
+case $out in */*) ;; *) out=./$out ;; esac  # the PGO step runs "$out": a bare name would be looked up in PATH
 compat=$(cd "$(dirname "$0")" && pwd)/compat  # <io.h> for revisions that predate the portable cli.cpp
 files=$(ls "$src"/*.cpp | grep -v gui.cpp)
 build() { g++ -O3 -march=native -std=c++17 -pthread -DNDEBUG -w -idirafter "$compat" "$@" $files -o "$out"; }
