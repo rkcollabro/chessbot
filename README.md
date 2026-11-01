@@ -103,7 +103,18 @@ chesscli booktxt data/book_vetted.txt book.bin
 chesscli extract data/positions.txt 3 1500000 games.pgn...
 chesscli tune data/positions.txt src/eval_weights.inc 400
 python tools/match.py "engines/new.exe uci" "engines/old.exe uci" --games 100 --tc 8+0.08 [--threads-a 4]
+chesscli selfplay data/sp.bin 100000 5000 1             # NNUE training data: games, nodes per move, seed
+python tools/nnue_train.py nnue.bin data/sp*.bin --epochs 10 [--hidden 512]
+chesscli nnuecheck 100                                   # incremental NNUE updates vs a full rebuild
+python tools/sprt.py <candidate> <base> --rule           # 60 games: pass with >30 wins and <=10 losses
 ```
+
+GitHub Actions (run from the Actions tab or `gh workflow run`):
+
+- **Match**: candidate ref vs base ref, games split across up to 20 runners, results combined in the run summary.
+  `gh workflow run match.yml -f candidate=my-branch -f base=master -f games=400`
+- **Generate data**: self-play on up to 20 runners for up to 5.5 hours each; positions are uploaded as artifacts.
+  `gh workflow run datagen.yml -f ref=master -f jobs=20 -f minutes=300`
 
 ## Credits
 
