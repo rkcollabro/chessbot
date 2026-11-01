@@ -1,0 +1,166 @@
+# Sequential test (SPRT) of candidate vs base, run in rounds across parallel runners. Each round plays
+# JOBS x PAIRS game pairs (each opening with both colors), adds them to the previous rounds' games, and stops
+# once the result is statistically clear: PASSED (candidate is at least about elo1 stronger), FAILED (it is not
+# better than elo0). Otherwise the round dispatches the next one, up to max_rounds.
+# Each revision is built from its own source and plays with the nnue.bin committed in that revision.
+name: SPRT
+run-name: SPRT ${{ inputs.candidate }} vs ${{ inputs.base }} (round ${{ inputs.round }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: Candidate git ref (branch, tag or commit)
+        required: true
+      base:
+        description: Base git ref
+        required: true
+        default: master
+      tc:
+        description: Time control, seconds+increment
+        default: "10+0.1"
+      elo0:
+        description: SPRT lower bound (Elo)
+        default: "0"
+      elo1:
+        description: SPRT upper bound (Elo)
+        default: "10"
+      max_rounds:
+        description: Give up as inconclusive after this many rounds (2000 games each)
+        default: "5"
+      candidate_flags:
+        description: Extra compiler flags for the candidate (e.g. -DNNUE_HIDDEN_SIZE=512)
+        default: ""
+      base_flags:
+        description: Extra compiler flags for the base
+        default: ""
+      round:
+        description: Round number (set by the previous round; leave at 1)
+        default: "1"
+      prev_run:
+        description: Run id of the previous round (set by the previous round; leave empty)
+        default: ""
+
+permissions:
+  actions: write
+  contents: read
+
+env:
+  JOBS: 20
+  PAIRS: 50  # per job and round: 20 x 50 pairs = 2000 games a round
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore tablebases
+        id: tb
+        uses: actions/cache@v4
+        with:
+          path: tb
+          key: tb-v1
+      - name: Generate tablebases
+        if: steps.tb.outputs.cache-hit != 'true'
+        run: sh tools/ci_build.sh src chesscli && ./chesscli tbgen
+      - name: Plan shards
+        id: plan
+        run: echo "shards=$(python3 -c "print(list(range($JOBS)))")" >> "$GITHUB_OUTPUT"
+
+  shard:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.setup.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/cache/restore@v4
+        with:
+          path: tb
+          key: tb-v1
+          fail-on-cache-miss: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install chess==1.11.2
+      - name: Build both engines
+        env:
+          CAND_REF: ${{ inputs.candidate }}
+          BASE_REF: ${{ inputs.base }}
+          CAND_FLAGS: ${{ inputs.candidate_flags }}
+          BASE_FLAGS: ${{ inputs.base_flags }}
+        run: |
+          for side in cand base; do
+            if [ $side = cand ]; then ref=$CAND_REF; flags=$CAND_FLAGS; else ref=$BASE_REF; flags=$BASE_FLAGS; fi
+            git worktree add "/tmp/$side" "origin/$ref" 2>/dev/null || git worktree add "/tmp/$side" "$ref"
+            mkdir -p "eng/$side"
+            sh tools/ci_build.sh "/tmp/$side/src" "eng/$side/chesscli" $flags
+            [ -f "/tmp/$side/nnue.bin" ] && cp "/tmp/$side/nnue.bin" "eng/$side/"
+            ln -s "$PWD/tb" "eng/$side/tb"
+          done
+      - name: Play
+        env:
+          TC: ${{ inputs.tc }}
+          ROUND: ${{ inputs.round }}
+        run: |
+          # Every round and shard starts at its own opening, so later rounds move on through the book.
+          offset=$(( ((ROUND - 1) * JOBS * PAIRS + ${{ matrix.shard }} * PAIRS) % 3000 ))
+          python3 tools/sprt.py eng/cand/chesscli eng/base/chesscli --fixed "$PAIRS" --offset "$offset" \
+            --tc "$TC" --concurrency 4 --json "result-${{ matrix.shard }}.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.shard }}
+          path: result-${{ matrix.shard }}.json
+          retention-days: 30
+
+  combine:
+    needs: shard
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          merge-multiple: true
+          path: results
+      - name: Previous rounds
+        if: inputs.prev_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: sprt-total
+          run-id: ${{ inputs.prev_run }}
+          github-token: ${{ github.token }}
+          path: results/prev
+      - name: Summary
+        id: sum
+        env:
+          TITLE: ${{ inputs.candidate }} vs ${{ inputs.base }} at ${{ inputs.tc }}, after round ${{ inputs.round }}
+        run: |
+          files=$(ls results/*.json results/prev/*.json 2>/dev/null)  # prev holds the earlier rounds' total
+          python3 tools/combine.py $files --sprt ${{ inputs.elo0 }} ${{ inputs.elo1 }} \
+            --title "$TITLE" --out sprt-total.json | tee summary.md
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+          echo "verdict=$(sed -n 's/^RESULT \([A-Z]*\).*/\1/p' summary.md)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sprt-total
+          path: sprt-total.json
+          retention-days: 30
+      - name: Next round
+        if: steps.sum.outputs.verdict == 'INCONCLUSIVE' && fromJson(inputs.round) < fromJson(inputs.max_rounds)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run sprt.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+            -f candidate="${{ inputs.candidate }}" -f base="${{ inputs.base }}" -f tc="${{ inputs.tc }}" \
+            -f elo0="${{ inputs.elo0 }}" -f elo1="${{ inputs.elo1 }}" -f max_rounds="${{ inputs.max_rounds }}" \
+            -f candidate_flags="${{ inputs.candidate_flags }}" -f base_flags="${{ inputs.base_flags }}" \
+            -f round="$(( ${{ inputs.round }} + 1 ))" -f prev_run="${{ github.run_id }}"
+          echo "Round $(( ${{ inputs.round }} + 1 )) dispatched." >> "$GITHUB_STEP_SUMMARY"
