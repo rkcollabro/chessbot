@@ -143,7 +143,7 @@ jobs:
         env:
           TITLE: ${{ inputs.candidate }} vs ${{ inputs.base }} at ${{ inputs.tc }}, after round ${{ inputs.round }}
         run: |
-          files=$(ls results/*.json results/prev/*.json 2>/dev/null)  # prev holds the earlier rounds' total
+          files=$(ls results/*.json results/prev/*.json 2>/dev/null || true)  # prev: earlier rounds' total
           python3 tools/combine.py $files --sprt ${{ inputs.elo0 }} ${{ inputs.elo1 }} \
             --title "$TITLE" --out sprt-total.json | tee summary.md
           cat summary.md >> "$GITHUB_STEP_SUMMARY"
