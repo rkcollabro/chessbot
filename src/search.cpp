@@ -15,6 +15,7 @@
 
 #include "book.h"
 #include "eval.h"
+#include "largepages.h"
 #include "tablebase.h"
 
 namespace {
@@ -38,7 +39,9 @@ struct TTData {
 };
 
 constexpr size_t TT_SIZE = size_t(1) << 22;  // 64 MB
-std::vector<TTEntry> g_tt(TT_SIZE);
+bool g_ttLarge = false;
+// All-zero bytes are an empty entry, which is what allocLargePages hands back.
+TTEntry* const g_tt = static_cast<TTEntry*>(allocLargePages(TT_SIZE * sizeof(TTEntry), g_ttLarge));
 
 inline uint64_t ttPack(Move m, int score, int depth, int flag) {
     return uint64_t(m & 0xFFFFF) | (uint64_t(uint16_t(score + 32768)) << 20) | (uint64_t(depth & 0xFF) << 36) |
@@ -784,10 +787,12 @@ int quiescenceScore(const Board& pos) {
     return s->qsearch(-INF, INF, 0);
 }
 
+bool hashOnLargePages() { return g_ttLarge; }
+
 void clearSearchMemory() {
-    for (auto& e : g_tt) {
-        e.keyXor.store(0, std::memory_order_relaxed);
-        e.data.store(0, std::memory_order_relaxed);
+    for (size_t i = 0; i < TT_SIZE; i++) {
+        g_tt[i].keyXor.store(0, std::memory_order_relaxed);
+        g_tt[i].data.store(0, std::memory_order_relaxed);
     }
     for (auto& s : g_pool) s->clearMemory();
 }

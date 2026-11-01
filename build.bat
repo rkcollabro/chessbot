@@ -19,7 +19,7 @@ if "%OUT%"=="" set "OUT=."
 if not exist build\pgo mkdir build\pgo
 if not exist "%OUT%" mkdir "%OUT%"
 set CFLAGS=/nologo /std:c++17 /O2 /arch:AVX2 /EHsc /W3 /MT /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8
-set CORE=src\board.cpp src\eval.cpp src\search.cpp src\tablebase.cpp src\book.cpp src\nnue.cpp
+set CORE=src\board.cpp src\eval.cpp src\search.cpp src\tablebase.cpp src\book.cpp src\nnue.cpp src\largepages.cpp
 
 rem chesscli is built with profile-guided optimization: an instrumented build runs the bench, then
 rem the linker lays out the code around the measured hot paths. Same source, same results, faster.

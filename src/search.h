@@ -48,4 +48,5 @@ Move findBestMove(const Board& root, int timeMs, std::atomic<bool>* stop, const 
 // Quiescence search score (side to move's view), used to filter tuning positions.
 int quiescenceScore(const Board& pos);
 void clearSearchMemory();
+bool hashOnLargePages();  // whether the transposition table got large pages
 std::string scoreToString(int score);  // "+0.35", "M4", "-M2"
