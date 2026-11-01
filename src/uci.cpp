@@ -13,6 +13,7 @@
 #include "board.h"
 #include "book.h"
 #include "search.h"
+#include "nnue.h"
 #include "tablebase.h"
 
 namespace {
@@ -67,6 +68,7 @@ void uciLoop(const std::string& tbDir, const std::string& bookPath) {
             std::printf("id name ChessBot\nid author Randy\n");
             std::printf("option name OwnBook type check default true\n");
             std::printf("option name Ponder type check default false\n");
+            std::printf("option name UseNNUE type check default true\n");
             std::printf("option name Threads type spin default 1 min 1 max 64\n");
             std::printf("option name Level type spin default 6 min 1 max 6\n");
             std::printf("option name LevelNodes type spin default -1 min -1 max 100000000\n");
@@ -82,6 +84,7 @@ void uciLoop(const std::string& tbDir, const std::string& bookPath) {
             while (in >> tok && tok != "value") name += " " + tok;
             in >> value;
             if (name == "OwnBook") ownBook = value == "true";
+            if (name == "UseNNUE") nnue::setEnabled(value == "true");
             if (name == "Threads") threads = std::max(1, std::atoi(value.c_str()));
             if (name == "Level") level = std::max(1, std::min(6, std::atoi(value.c_str())));
             if (name == "LevelNodes") levelNodes = std::atoi(value.c_str());

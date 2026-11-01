@@ -10,18 +10,29 @@
 //   chesscli booktxt <vetted.txt> <book.bin>
 //   chesscli extract <out.txt> <perGame> <maxPositions> <pgn>...
 //   chesscli tune <data.txt> <out.inc> [epochs]
+//   chesscli selfplay <out.bin> <games> <nodes> <seed>   NNUE training data from self-play
+//   chesscli eval <fen>           static evaluation (NNUE when nnue.bin is next to the exe)
+//   chesscli nnuecheck <games>    incremental NNUE updates vs. a full rebuild over random games
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#ifdef _WIN32
 #include <io.h>
+#define isatty _isatty
+#define fileno _fileno
+#else
+#include <unistd.h>
+#endif
 #include <string>
 #include <vector>
 
 #include "board.h"
+#include "eval.h"
 #include "datagen.h"
 #include "search.h"
 #include "tablebase.h"
 #include "uci.h"
+#include "nnue.h"
 
 static bool g_checkHash = false;
 static bool g_hashOk = true;
@@ -68,12 +79,13 @@ int main(int argc, char** argv) {
     initTables();
     // With no arguments, run as a UCI engine when stdin is a pipe (GUIs and lichess-bot launch it that way)
     // and run the test suite from a console.
-    std::string cmd = argc > 1 ? argv[1] : _isatty(_fileno(stdin)) ? "test" : "uci";
+    std::string cmd = argc > 1 ? argv[1] : isatty(fileno(stdin)) ? "test" : "uci";
     auto t0 = std::chrono::steady_clock::now();
     auto ms = [&] {
         return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     };
 
+    nnue::load(exeDir(argv[0]) + "/nnue.bin");  // optional; without it the hand-written evaluation is used
     if (cmd == "uci") {
         uciLoop(exeDir(argv[0]) + "/tb", exeDir(argv[0]) + "/book.bin");
         // Skip static destructors: the detached tablebase loader may still be using the tables.
@@ -88,6 +100,41 @@ int main(int argc, char** argv) {
     if (cmd == "extract" && argc > 5)
         return extractPositions(argv[2], std::atoi(argv[3]), std::atoi(argv[4]),
                                 std::vector<std::string>(argv + 5, argv + argc));
+    if (cmd == "selfplay" && argc > 5) {
+        tb::init(exeDir(argv[0]) + "/tb");
+        return selfplay(argv[2], std::atoi(argv[3]), std::atoi(argv[4]), unsigned(std::atoi(argv[5])));
+    }
+    if (cmd == "eval" && argc > 2) {  // static evaluation (NNUE if nnue.bin is loaded), side to move's view
+        Board b;
+        if (!b.setFEN(joinArgs(argc, argv, 2))) return std::printf("bad fen\n"), 1;
+        std::printf("%d\n", evaluate(b));
+        return 0;
+    }
+    if (cmd == "nnuecheck" && argc > 2) {
+        if (!nnue::active()) return std::printf("no network loaded\n"), 1;
+        std::srand(1);
+        long checked = 0, bad = 0;
+        for (int g = 0; g < std::atoi(argv[2]); g++) {
+            Board b;
+            b.setStartPos();
+            for (int ply = 0; ply < 200; ply++) {
+                MoveList ml;
+                b.genLegal(ml);
+                if (!ml.count) break;
+                // Wander a little (make/unmake a few moves) so cached ancestors get reused, then advance.
+                for (int k = 0; k < 3; k++) {
+                    b.makeMove(ml.moves[std::rand() % ml.count]);
+                    Board fresh;
+                    fresh.setFEN(b.getFEN());
+                    bad += evaluate(b) != evaluate(fresh), checked++;
+                    b.unmakeMove();
+                }
+                b.makeMove(ml.moves[std::rand() % ml.count]);
+            }
+        }
+        std::printf("checked %ld positions, %ld mismatches\n", checked, bad);
+        return bad != 0;
+    }
     if (cmd == "tune" && argc > 3) return tune(argv[2], argv[3], argc > 4 ? std::atoi(argv[4]) : 300);
 
     if (cmd == "test") {

@@ -13,8 +13,8 @@ set "PATH=%PATH%;%ProgramFiles(x86)%\Microsoft Visual Studio\Installer"
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 
 if not exist build mkdir build
-set CFLAGS=/nologo /std:c++17 /O2 /EHsc /W3 /MT /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8
-set CORE=src\board.cpp src\eval.cpp src\search.cpp src\tablebase.cpp src\book.cpp
+set CFLAGS=/nologo /std:c++17 /O2 /arch:AVX2 /EHsc /W3 /MT /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8
+set CORE=src\board.cpp src\eval.cpp src\search.cpp src\tablebase.cpp src\book.cpp src\nnue.cpp
 
 cl %CFLAGS% /Fobuild\ /Fe:chesscli.exe %CORE% src\uci.cpp src\datagen.cpp src\cli.cpp /link /STACK:8388608 || exit /b 1
 rc /nologo /fo build\resources.res src\resources.rc || exit /b 1

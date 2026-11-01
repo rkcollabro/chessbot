@@ -1,5 +1,7 @@
 #include "eval.h"
 
+#include "nnue.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -250,6 +252,7 @@ int variantTerms(const Board& b) {
 }  // namespace
 
 int evaluate(const Board& b) {
+    if ((b.variant == STANDARD || b.variant == CHESS960) && nnue::active()) return nnue::evaluate(b);
     ScoreAcc acc;
     int phase = evalCore(b, acc);
     int score = (acc.mg * phase + acc.eg * (MAX_PHASE - phase)) / MAX_PHASE;

@@ -14,6 +14,7 @@
 #include "book.h"
 #include "eval.h"
 #include "search.h"
+#include "tablebase.h"
 
 namespace {
 
@@ -233,6 +234,107 @@ int extractPositions(const std::string& out, int perGame, int maxPositions, cons
         return written < maxPositions;
     });
     std::printf("wrote %lld positions to %s\n", written, out.c_str());
+    return 0;
+}
+
+// ---------------------------------------------------------------- NNUE training data
+
+namespace {
+
+// One training position, 68 bytes: up to 32 (square, piece) pairs (0xFF-padded), the search score and the
+// game result, both from the side to move's point of view.
+#pragma pack(push, 1)
+struct PackedPos {
+    uint8_t squares[32];
+    uint8_t pieces[32];  // makePiece(color, type)
+    int16_t score;       // centipawns
+    uint8_t result;      // 2 win, 1 draw, 0 loss
+    uint8_t stm;
+};
+#pragma pack(pop)
+static_assert(sizeof(PackedPos) == 68, "PackedPos layout");
+
+}  // namespace
+
+// Self-play games at a fixed node count per move, starting from random 8-9 ply openings. Writes quiet
+// positions (not in check, best move not a capture or promotion, no mate score) with the engine's score and
+// the final result. Games end by the rules, by tablebase, by agreement on a +-20 pawn score, or at 400 plies.
+int selfplay(const std::string& out, int games, int nodes, unsigned seed) {
+    tb::loadOrGenerateAll(nullptr);
+    std::FILE* f = std::fopen(out.c_str(), "ab");
+    if (!f) return std::printf("cannot open %s\n", out.c_str()), 1;
+    std::mt19937 rng(seed);
+    long long positions = 0;
+    for (int g = 0; g < games; g++) {
+        Board b;
+        b.setStartPos();
+        clearSearchMemory();
+        // Random opening, discarded if it already loses material or the game.
+        int randomPlies = 8 + int(rng() % 2);
+        bool ok = true;
+        for (int i = 0; i < randomPlies && ok; i++) {
+            MoveList ml;
+            b.genLegal(ml);
+            if (!ml.count) ok = false;
+            else b.makeMove(ml.moves[rng() % ml.count]);
+        }
+        if (!ok) continue;
+        int openingScore = 0;
+        findBestMove(b, 1 << 30, nullptr, [&](const SearchInfo& si) { openingScore = si.score; }, false, 1, 2000);
+        if (std::abs(openingScore) > 200) continue;
+
+        std::vector<PackedPos> recorded;
+        double whiteResult = -1;  // 1, 0.5, 0
+        int decisive = 0;
+        while (whiteResult < 0) {
+            MoveList ml;
+            b.genLegal(ml);
+            if (!ml.count) {
+                whiteResult = b.inCheck() ? (b.stm == WHITE ? 0 : 1) : 0.5;
+                break;
+            }
+            if (b.halfmove >= 100 || b.repetitionCount() >= 3 || b.insufficientMaterial() || b.fullmove > 200) {
+                whiteResult = 0.5;
+                break;
+            }
+            int v;
+            if (b.pieceCount <= 4 && tb::probe(b, v)) {
+                whiteResult = v == 0 ? 0.5 : ((v > 0) == (b.stm == WHITE) ? 1 : 0);
+                break;
+            }
+            int score = 0;
+            Move m = findBestMove(b, 1 << 30, nullptr, [&](const SearchInfo& si) { score = si.score; }, false, 1,
+                                  nodes);
+            if (!m) break;
+            decisive = std::abs(score) >= 2000 ? decisive + 1 : 0;
+            if (decisive >= 4) {
+                whiteResult = (score > 0) == (b.stm == WHITE) ? 1 : 0;
+                break;
+            }
+            if (!b.inCheck() && !isCapture(m) && !movePromo(m) && std::abs(score) < 2000) {
+                PackedPos p;
+                std::memset(&p, 0xFF, sizeof(p));
+                int k = 0;
+                for (int s = 0; s < 64; s++)
+                    if (b.sq[s] != EMPTY && k < 32) p.squares[k] = uint8_t(s), p.pieces[k++] = uint8_t(b.sq[s]);
+                p.score = int16_t(score);
+                p.stm = uint8_t(b.stm);
+                recorded.push_back(p);
+            }
+            b.makeMove(m);
+        }
+        if (whiteResult < 0) continue;
+        for (PackedPos& p : recorded) {
+            double r = p.stm == WHITE ? whiteResult : 1 - whiteResult;
+            p.result = uint8_t(r > 0.75 ? 2 : r < 0.25 ? 0 : 1);
+        }
+        std::fwrite(recorded.data(), sizeof(PackedPos), recorded.size(), f);
+        std::fflush(f);
+        positions += recorded.size();
+        if ((g + 1) % 100 == 0) std::printf("games %d positions %lld\n", g + 1, positions), std::fflush(stdout);
+    }
+    std::fclose(f);
+    std::printf("done: %lld positions\n", positions);
     return 0;
 }
 

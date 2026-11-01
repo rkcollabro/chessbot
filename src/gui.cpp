@@ -19,6 +19,7 @@
 #include "board.h"
 #include "book.h"
 #include "search.h"
+#include "nnue.h"
 #include "tablebase.h"
 
 namespace {
@@ -820,6 +821,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
     updateMenuChecks();
 
     book::load(exeDir() + "\\book.bin");
+    nnue::load(exeDir() + "\\nnue.bin");  // optional network
 
     // Load (or build, on first run) the endgame tables in the background.
     tb::init(exeDir() + "\\tb");

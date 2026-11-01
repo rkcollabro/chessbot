@@ -1,0 +1,122 @@
+# Engine match split across parallel runners: candidate vs base, each opening played with both colors.
+# Each revision is built from its own source and plays with the nnue.bin committed in that revision.
+name: Match
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: Candidate git ref (branch, tag or commit)
+        required: true
+      base:
+        description: Base git ref
+        required: true
+        default: master
+      games:
+        description: Total games (split evenly across the jobs)
+        default: "400"
+      jobs:
+        description: Parallel jobs (at most 20)
+        default: "20"
+      tc:
+        description: Time control, seconds+increment
+        default: "10+0.1"
+      candidate_flags:
+        description: Extra compiler flags for the candidate (e.g. -DNNUE_HIDDEN_SIZE=512)
+        default: ""
+      base_flags:
+        description: Extra compiler flags for the base
+        default: ""
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+      pairs: ${{ steps.plan.outputs.pairs }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore tablebases
+        id: tb
+        uses: actions/cache@v4
+        with:
+          path: tb
+          key: tb-v1
+      - name: Generate tablebases
+        if: steps.tb.outputs.cache-hit != 'true'
+        run: sh tools/ci_build.sh src chesscli && ./chesscli tbgen
+      - name: Plan shards
+        id: plan
+        env:
+          GAMES: ${{ inputs.games }}
+          JOBS: ${{ inputs.jobs }}
+        run: |
+          jobs=$(( JOBS > 20 ? 20 : JOBS ))
+          pairs=$(( (GAMES / 2 + jobs - 1) / jobs ))
+          echo "shards=$(python3 -c "print(list(range($jobs)))")" >> "$GITHUB_OUTPUT"
+          echo "pairs=$pairs" >> "$GITHUB_OUTPUT"
+
+  shard:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.setup.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/cache/restore@v4
+        with:
+          path: tb
+          key: tb-v1
+          fail-on-cache-miss: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install chess==1.11.2
+      - name: Build both engines
+        env:
+          CAND_REF: ${{ inputs.candidate }}
+          BASE_REF: ${{ inputs.base }}
+          CAND_FLAGS: ${{ inputs.candidate_flags }}
+          BASE_FLAGS: ${{ inputs.base_flags }}
+        run: |
+          for side in cand base; do
+            if [ $side = cand ]; then ref=$CAND_REF; flags=$CAND_FLAGS; else ref=$BASE_REF; flags=$BASE_FLAGS; fi
+            git worktree add "/tmp/$side" "origin/$ref" 2>/dev/null || git worktree add "/tmp/$side" "$ref"
+            mkdir -p "eng/$side"
+            sh tools/ci_build.sh "/tmp/$side/src" "eng/$side/chesscli" $flags
+            [ -f "/tmp/$side/nnue.bin" ] && cp "/tmp/$side/nnue.bin" "eng/$side/"
+            ln -s "$PWD/tb" "eng/$side/tb"
+          done
+      - name: Play
+        env:
+          PAIRS: ${{ needs.setup.outputs.pairs }}
+          TC: ${{ inputs.tc }}
+        run: |
+          offset=$(( (${{ github.run_number }} * 997 + ${{ matrix.shard }} * PAIRS) % 3000 ))
+          python3 tools/sprt.py eng/cand/chesscli eng/base/chesscli --fixed "$PAIRS" --offset "$offset" \
+            --tc "$TC" --concurrency 4 --json "result-${{ matrix.shard }}.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.shard }}
+          path: result-${{ matrix.shard }}.json
+          retention-days: 30
+
+  combine:
+    needs: shard
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          merge-multiple: true
+          path: results
+      - name: Summary
+        env:
+          TITLE: ${{ inputs.candidate }} vs ${{ inputs.base }} at ${{ inputs.tc }}
+        run: python3 tools/combine.py results/*.json --title "$TITLE" | tee -a "$GITHUB_STEP_SUMMARY"

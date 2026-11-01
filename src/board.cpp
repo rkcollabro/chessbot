@@ -191,6 +191,19 @@ void Board::clear() {
     std::memset(castleMask, 15, sizeof(castleMask));
     undoStack.clear();
     hashHistory.clear();
+    nnueStack.resize(1);
+    nnueStack[0].computed = false;
+    nnueStack[0].refresh = true;
+}
+
+NnueAccum& Board::pushAccum() {
+    size_t i = undoStack.size();
+    if (nnueStack.size() <= i) nnueStack.resize(i + 1);
+    NnueAccum& a = nnueStack[i];
+    a.computed = false;
+    a.refresh = false;
+    a.ndirty = 0;
+    return a;
 }
 
 inline void Board::addPiece(int s, int p) {
@@ -212,6 +225,8 @@ inline void Board::removePiece(int s) {
 
 void Board::put(int s, int piece) {
     checkCache = -1;
+    nnueStack[undoStack.size()].computed = false;
+    nnueStack[undoStack.size()].refresh = true;
     if (sq[s]) {
         removePiece(s);
         pieceCount--;
@@ -560,9 +575,11 @@ bool Board::makeMove(Move m) {
     undoStack.push_back({m, cap, castle, ep, halfmove, hash, checkCache, promoted,
                          {uint8_t(checks[0]), uint8_t(checks[1])}});
     hashHistory.push_back(hash);
+    NnueAccum& acc = pushAccum();
 
     if (ep >= 0) hash ^= Z_ep[fileOf(ep)];
     if (drop) {
+        dirty(acc, p, to, 1);
         addPiece(to, p);
         hash ^= Z_piece[p][to];
         pieceCount++;
@@ -571,6 +588,10 @@ bool Board::makeMove(Move m) {
         int kt, rf, rt;
         castleSquares(m, kt, rf, rt);
         int rook = sq[rf];
+        dirty(acc, p, from, -1);
+        dirty(acc, rook, rf, -1);
+        dirty(acc, p, kt, 1);
+        dirty(acc, rook, rt, 1);
         removePiece(from);
         removePiece(rf);
         addPiece(kt, p);
@@ -580,6 +601,7 @@ bool Board::makeMove(Move m) {
     } else {
         if (cap) {
             hash ^= Z_piece[cap][capSq];
+            dirty(acc, cap, capSq, -1);
             removePiece(capSq);
             pieceCount--;
             if (variant == CRAZYHOUSE) {
@@ -590,6 +612,8 @@ bool Board::makeMove(Move m) {
         hash ^= Z_piece[p][from];
         removePiece(from);
         int np = movePromo(m) ? makePiece(stm, movePromo(m)) : p;
+        dirty(acc, p, from, -1);
+        dirty(acc, np, to, 1);
         addPiece(to, np);
         hash ^= Z_piece[np][to];
         if (typeOf(p) == KING) kingSq[stm] = to;
@@ -676,6 +700,7 @@ void Board::makeNull() {
                          {uint8_t(checks[0]), uint8_t(checks[1])}});
     checkCache = -1;
     hashHistory.push_back(hash);
+    pushAccum();
     if (ep >= 0) hash ^= Z_ep[fileOf(ep)];
     ep = -1;
     halfmove++;

@@ -1,0 +1,86 @@
+# NNUE training data: each job plays self-play games on all its cores for a fixed time and uploads the
+# positions (tools/nnue_train.py format, zstd-compressed). The engine uses the nnue.bin committed in the ref.
+name: Generate data
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref whose engine and network play the games
+        required: true
+        default: master
+      jobs:
+        description: Parallel jobs (at most 20)
+        default: "20"
+      minutes:
+        description: Minutes of self-play per job (at most 330)
+        default: "300"
+      nodes:
+        description: Search nodes per move
+        default: "5000"
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore tablebases
+        id: tb
+        uses: actions/cache@v4
+        with:
+          path: tb
+          key: tb-v1
+      - name: Generate tablebases
+        if: steps.tb.outputs.cache-hit != 'true'
+        run: sh tools/ci_build.sh src chesscli && ./chesscli tbgen
+      - name: Plan shards
+        id: plan
+        env:
+          JOBS: ${{ inputs.jobs }}
+        run: |
+          jobs=$(( JOBS > 20 ? 20 : JOBS ))
+          echo "shards=$(python3 -c "print(list(range($jobs)))")" >> "$GITHUB_OUTPUT"
+
+  selfplay:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.setup.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/cache/restore@v4
+        with:
+          path: tb
+          key: tb-v1
+          fail-on-cache-miss: true
+      - name: Build
+        run: sh tools/ci_build.sh src chesscli
+      - name: Self-play
+        env:
+          MINUTES: ${{ inputs.minutes }}
+          NODES: ${{ inputs.nodes }}
+        run: |
+          minutes=$(( MINUTES > 330 ? 330 : MINUTES ))
+          cores=$(nproc)
+          for i in $(seq 1 "$cores"); do
+            seed=$(( ${{ github.run_id }} % 100000 * 1000 + ${{ matrix.shard }} * 16 + i ))
+            timeout "${minutes}m" ./chesscli selfplay "sp_$i.bin" 100000000 "$NODES" "$seed" > "sp_$i.log" 2>&1 &
+          done
+          wait || true
+          # A process stopped mid-write can leave a partial record; trim each file to whole 68-byte records.
+          for f in sp_*.bin; do truncate -s $(( $(stat -c %s "$f") / 68 * 68 )) "$f"; done
+          cat sp_*.bin | zstd -9 -T0 -o "data-${{ matrix.shard }}.bin.zst"
+          echo "positions: $(( $(cat sp_*.bin | wc -c) / 68 ))"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: data-${{ matrix.shard }}
+          path: data-${{ matrix.shard }}.bin.zst
+          compression-level: 0
+          retention-days: 14

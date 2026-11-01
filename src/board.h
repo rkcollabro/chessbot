@@ -116,6 +116,20 @@ struct Undo {
     uint8_t checks[2];
 };
 
+// NNUE first-layer sums for one position (see nnue.cpp). Each move records the pieces it added and removed,
+// and the sums are brought up to date lazily from the nearest computed ancestor when the position is evaluated.
+#ifndef NNUE_HIDDEN_SIZE
+#define NNUE_HIDDEN_SIZE 256  // must match the network file; build with -DNNUE_HIDDEN_SIZE=512 for a wider net
+#endif
+constexpr int NNUE_HIDDEN = NNUE_HIDDEN_SIZE;
+struct NnueAccum {
+    alignas(64) int16_t v[2][NNUE_HIDDEN];  // [perspective]
+    bool computed = false;
+    bool refresh = true;  // no usable parent: rebuild from the board
+    int ndirty = 0;
+    int8_t dirtyPiece[4], dirtySq[4], dirtySign[4];
+};
+
 class Board {
 public:
     int sq[64];
@@ -139,6 +153,7 @@ public:
     mutable int checkCache = -1;  // -1 unknown, else whether the side to move is in check
     std::vector<Undo> undoStack;
     std::vector<uint64_t> hashHistory;  // hash before each move made
+    mutable std::vector<NnueAccum> nnueStack;  // indexed by undoStack.size()
 
     Board();
     void clear();
@@ -186,6 +201,15 @@ private:
     void removePiece(int s);
     void changePocket(int c, int t, int delta);
     void castleSquares(Move m, int& kingTo, int& rookFrom, int& rookTo) const;
+    NnueAccum& pushAccum();
+    static void dirty(NnueAccum& a, int piece, int s, int sign) {
+        if (a.ndirty == 4) {
+            a.refresh = true;
+            return;
+        }
+        a.dirtyPiece[a.ndirty] = int8_t(piece), a.dirtySq[a.ndirty] = int8_t(s), a.dirtySign[a.ndirty] = int8_t(sign);
+        a.ndirty++;
+    }
 };
 
 void initTables();

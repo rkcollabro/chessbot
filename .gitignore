@@ -6,3 +6,7 @@ data/
 engines/
 tools/stockfish/
 __pycache__/
+nets/
+logs/
+*.tar
+*.zst
