@@ -217,9 +217,19 @@ public:
     Move counterMoves[16][64];  // [previous moved piece][previous to-square] -> refutation
     int history[2][64][64];     // [color][from][to], bounded by gravity to +-16384
 
+    // Correction history: how far the static eval has been from the search result in positions with the same
+    // pawn structure, as a running average in 1/CORR_GRAIN centipawns. Added to the static eval, so pruning
+    // decisions in a structure the network misjudges lean on what deeper searches have already found there.
+    static constexpr int CORR_SIZE = 16384;
+    static constexpr int CORR_GRAIN = 256;
+    static constexpr int CORR_WEIGHT_SCALE = 256;
+    static constexpr int CORR_MAX = CORR_GRAIN * 64;  // at most 64 centipawns either way
+    int pawnCorr[2][CORR_SIZE];  // [side to move][pawn key]
+
     Move pv[MAX_PLY][MAX_PLY];
     int pvLen[MAX_PLY];
-    int evalStack[MAX_PLY];
+    int evalStack[MAX_PLY];  // static eval with the correction applied
+    int rawEvalStack[MAX_PLY];  // static eval as the network gave it
     Move moveStack[MAX_PLY];
     int pieceStack[MAX_PLY];
     Move excluded[MAX_PLY];
@@ -233,6 +243,7 @@ public:
         std::memset(killers, 0, sizeof(killers));
         std::memset(counterMoves, 0, sizeof(counterMoves));
         std::memset(history, 0, sizeof(history));
+        std::memset(pawnCorr, 0, sizeof(pawnCorr));
     }
 
     int elapsed() const {
@@ -268,6 +279,26 @@ public:
     }
 
     void updateHistory(int& h, int bonus) { h += bonus - h * std::abs(bonus) / 16384; }
+
+    int& pawnCorrEntry() {
+        uint64_t k = (b.pieces[WHITE][PAWN] * 0x9E3779B97F4A7C15ULL) ^ (b.pieces[BLACK][PAWN] * 0xC2B2AE3D27D4EB4FULL);
+        k ^= k >> 31;
+        return pawnCorr[b.stm][k & (CORR_SIZE - 1)];
+    }
+
+    int corrected(int raw) {
+        int e = raw + pawnCorrEntry() / CORR_GRAIN;
+        return std::max(-MATE_BOUND + 1, std::min(MATE_BOUND - 1, e));
+    }
+
+    // Move the entry toward the gap between the search result and the raw static eval, more for deeper searches.
+    void updateCorrection(int raw, int score, int depth) {
+        int& c = pawnCorrEntry();
+        int weight = std::min(depth + 1, 16);
+        int target = (score - raw) * CORR_GRAIN;
+        c = (c * (CORR_WEIGHT_SCALE - weight) + target * weight) / CORR_WEIGHT_SCALE;
+        c = std::max(-CORR_MAX, std::min(CORR_MAX, c));
+    }
 
     Move counterFor(int ply) const {
         if (ply == 0 || !moveStack[ply - 1]) return NO_MOVE;
@@ -328,7 +359,7 @@ public:
         int best = -INF;
         const int origAlpha = alpha;
         if (!inCheck) {
-            best = eval();
+            best = corrected(eval());
             if (best >= beta) return best;
             if (best > alpha) alpha = best;
         }
@@ -405,14 +436,18 @@ public:
              (tt.flag == TT_UPPER && ttScore <= alpha)))
             return ttScore;
 
-        int staticEval;
-        if (inCheck)
-            staticEval = -INF;
-        else if (excludedMove)
+        int staticEval, rawEval;
+        if (inCheck) {
+            staticEval = rawEval = -INF;
+        } else if (excludedMove) {
             staticEval = evalStack[ply];  // same position, already evaluated
-        else
-            staticEval = eval();
+            rawEval = rawEvalStack[ply];
+        } else {
+            rawEval = eval();
+            staticEval = corrected(rawEval);
+        }
         evalStack[ply] = staticEval;
+        rawEvalStack[ply] = rawEval;
         const bool improving = !inCheck && ply >= 2 && staticEval > evalStack[ply - 2];
 
         // Internal iterative reduction: without a known best move, search this node a bit shallower.
@@ -549,6 +584,13 @@ public:
         if (!excludedMove) {
             int flag = best >= beta ? TT_LOWER : (best > origAlpha ? TT_EXACT : TT_UPPER);
             ttStore(b.hash, bestMove, scoreToTT(best, ply), depth, flag);
+            // Learn from the result only when it says something about the eval: a quiet best move (a capture's
+            // gain is material the eval could not see coming), a non-mate score, and a bound on the
+            // informative side (a fail-high below the eval, or a fail-low above it, gives no direction).
+            const bool quietBest = !bestMove || (!isCapture(bestMove) && !movePromo(bestMove));
+            if (!inCheck && quietBest && std::abs(best) < MATE_BOUND && !(flag == TT_LOWER && best <= staticEval) &&
+                !(flag == TT_UPPER && best >= staticEval))
+                updateCorrection(rawEval, best, depth);
         }
         return best;
     }
