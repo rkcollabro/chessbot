@@ -37,8 +37,27 @@ namespace attacks {
 Bitboard pawn(int color, int s) { return PAWN_ATT[color][s]; }
 Bitboard knight(int s) { return KNIGHT_ATT[s]; }
 Bitboard king(int s) { return KING_ATT[s]; }
+
+// Magic bitboards: the blockers that matter (the slider's rays minus their edge squares) are
+// multiplied by a per-square magic number whose top bits index a table of precomputed attacks.
+// Tables are filled from the classical ray scan below, so the two always agree.
+struct Magic {
+    Bitboard mask;
+    uint64_t magic;
+    const Bitboard* table;
+    int shift;
+};
+Magic ROOK_MAGIC[64], BISHOP_MAGIC[64];
+Bitboard ROOK_TABLE[102400], BISHOP_TABLE[5248];
+
+inline Bitboard magicLookup(const Magic& m, Bitboard occ) {
+    return m.table[((occ & m.mask) * m.magic) >> m.shift];
+}
+Bitboard bishop(int s, Bitboard occ) { return magicLookup(BISHOP_MAGIC[s], occ); }
+Bitboard rook(int s, Bitboard occ) { return magicLookup(ROOK_MAGIC[s], occ); }
+
 // Classical ray attacks: the nearest blocker along each ray cuts off the rest of the ray.
-Bitboard bishop(int s, Bitboard occ) {
+Bitboard bishopSlow(int s, Bitboard occ) {
     Bitboard a = 0;
     for (int d : {2, 3, 6, 7}) {
         Bitboard r = RAY[d][s], blockers = r & occ;
@@ -47,7 +66,7 @@ Bitboard bishop(int s, Bitboard occ) {
     }
     return a;
 }
-Bitboard rook(int s, Bitboard occ) {
+Bitboard rookSlow(int s, Bitboard occ) {
     Bitboard a = 0;
     for (int d : {0, 1, 4, 5}) {
         Bitboard r = RAY[d][s], blockers = r & occ;
@@ -56,7 +75,71 @@ Bitboard rook(int s, Bitboard occ) {
     }
     return a;
 }
+
+// Finds a magic for each square by trial: a candidate works if no two blocker sets that give
+// different attacks land on the same table slot. Fixed seed, so the tables are the same every run.
+void initMagics(Magic* magics, Bitboard* table, const int* dirs, Bitboard (*slow)(int, Bitboard)) {
+    uint64_t seed = 0x5EED0F0A61C5ULL;
+    static Bitboard occs[4096], refs[4096];
+    static int epoch[4096], tries = 0;
+    Bitboard* next = table;
+    for (int s = 0; s < 64; s++) {
+        Magic& m = magics[s];
+        m.mask = 0;
+        for (int i = 0; i < 4; i++) {
+            Bitboard r = RAY[dirs[i]][s];
+            if (r) m.mask |= r & ~bit(dirs[i] < 4 ? msb(r) : lsb(r));  // the edge square never blocks anything
+        }
+        const int bits = popcount(m.mask), n = 1 << bits;
+        m.shift = 64 - bits;
+        m.table = next;
+        Bitboard sub = 0;
+        for (int i = 0; i < n; i++) {  // every subset of the mask (carry-rippler)
+            occs[i] = sub;
+            refs[i] = slow(s, sub);
+            sub = (sub - m.mask) & m.mask;
+        }
+        for (;;) {
+            m.magic = splitmix(seed) & splitmix(seed) & splitmix(seed);  // sparse candidates work best
+            if (popcount((m.mask * m.magic) >> 56) < 6) continue;
+            tries++;
+            bool ok = true;
+            for (int i = 0; i < n && ok; i++) {
+                size_t idx = (occs[i] * m.magic) >> m.shift;
+                if (epoch[idx] != tries) {
+                    epoch[idx] = tries;
+                    next[idx] = refs[i];
+                } else if (next[idx] != refs[i]) {
+                    ok = false;
+                }
+            }
+            if (ok) break;
+        }
+        next += n;
+    }
+}
 }  // namespace attacks
+
+bool checkMagics() {
+    // Every relevant blocker subset on every square, with random pieces outside the mask too.
+    uint64_t seed = 42;
+    long bad = 0;
+    for (int bishopPass = 0; bishopPass < 2; bishopPass++)
+        for (int s = 0; s < 64; s++) {
+            const attacks::Magic& m = bishopPass ? attacks::BISHOP_MAGIC[s] : attacks::ROOK_MAGIC[s];
+            Bitboard sub = 0;
+            do {
+                for (Bitboard occ : {sub, sub | (splitmix(seed) & ~m.mask)}) {
+                    occ &= ~bit(s);
+                    Bitboard fast = bishopPass ? attacks::bishop(s, occ) : attacks::rook(s, occ);
+                    Bitboard slow = bishopPass ? attacks::bishopSlow(s, occ) : attacks::rookSlow(s, occ);
+                    bad += fast != slow;
+                }
+                sub = (sub - m.mask) & m.mask;
+            } while (sub);
+        }
+    return bad == 0;
+}
 
 void initTables() {
     static bool done = false;
@@ -100,6 +183,10 @@ void initTables() {
     for (auto& side : Z_pocket)
         for (auto& row : side)
             for (auto& z : row) z = splitmix(seed);
+
+    const int ROOK_DIRS[4] = {0, 1, 4, 5}, BISHOP_DIRS[4] = {2, 3, 6, 7};
+    attacks::initMagics(attacks::ROOK_MAGIC, attacks::ROOK_TABLE, ROOK_DIRS, attacks::rookSlow);
+    attacks::initMagics(attacks::BISHOP_MAGIC, attacks::BISHOP_TABLE, BISHOP_DIRS, attacks::bishopSlow);
 }
 
 const char* variantName(int v) {

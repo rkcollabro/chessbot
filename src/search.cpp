@@ -9,6 +9,9 @@
 #include <memory>
 #include <thread>
 #include <vector>
+#ifdef _MSC_VER
+#include <xmmintrin.h>
+#endif
 
 #include "book.h"
 #include "eval.h"
@@ -40,6 +43,16 @@ std::vector<TTEntry> g_tt(TT_SIZE);
 inline uint64_t ttPack(Move m, int score, int depth, int flag) {
     return uint64_t(m & 0xFFFFF) | (uint64_t(uint16_t(score + 32768)) << 20) | (uint64_t(depth & 0xFF) << 36) |
            (uint64_t(flag) << 44);
+}
+
+// Start pulling a position's entry into cache as soon as its key is known, so the probe that
+// follows a few hundred instructions later doesn't stall on main memory.
+inline void ttPrefetch(uint64_t key) {
+#ifdef _MSC_VER
+    _mm_prefetch((const char*)&g_tt[key & (TT_SIZE - 1)], _MM_HINT_T0);
+#else
+    __builtin_prefetch(&g_tt[key & (TT_SIZE - 1)]);
+#endif
 }
 
 bool ttProbe(uint64_t key, TTData& d) {
@@ -334,6 +347,7 @@ public:
                 if (!movePromo(m) && best + PIECE_VALUE[victim] + 200 < alpha) continue;
             }
             if (!b.makeMove(m)) continue;
+            ttPrefetch(b.hash);
             legal++;
             int s = -qsearch(-beta, -alpha, ply + 1);
             b.unmakeMove();
@@ -410,6 +424,7 @@ public:
                 int R = 3 + depth / 4 + std::min(3, (staticEval - beta) / 200);
                 moveStack[ply] = NO_MOVE;
                 b.makeNull();
+                ttPrefetch(b.hash);
                 int s = -negamax(depth - 1 - R, -beta, -beta + 1, ply + 1, false);
                 b.unmakeNull();
                 if (stopped) return 0;
@@ -463,6 +478,7 @@ public:
             }
 
             if (!b.makeMove(m)) continue;
+            ttPrefetch(b.hash);
             legal++;
             if (quiet && nQuiets < 64) quiets[nQuiets++] = m;
             moveStack[ply] = m;
