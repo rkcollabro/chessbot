@@ -4,10 +4,18 @@ Network: 768 inputs per side (own/enemy x piece type x square, mirrored for Blac
 clipped ReLU, the side to move's and the opponent's halves concatenated -> 1 output, 1.0 = 400 centipawns.
 The target mixes the engine's search score and the game result:
     target = LAMBDA * sigmoid(score / 400) + (1 - LAMBDA) * result
+Endgame positions (at most --endgame-pieces pieces) can use their own --lambda-endgame. Self-play used to shuffle
+won endgames into 50-move draws, so their result labels are less trustworthy than their search scores.
 
-    python3 tools/nnue_train.py <out.bin> <data.bin>... [--epochs 20] [--lambda 0.7]
+The data is streamed from disk: each epoch reads the files in shuffled 1M-position chunks, mixes several chunks
+in memory and shuffles them, so the data set can be far larger than RAM. Features are built on the training
+device (CUDA when available).
+
+    python tools/nnue_train.py <out.bin> <data.bin>... [--epochs 10] [--lambda 0.7] [--lambda-endgame 0.9]
+                               [--init old.bin.pt] [--hidden 256] [--device cuda]
 """
 import argparse
+import math
 import struct
 import time
 
@@ -19,27 +27,42 @@ INPUTS = 768
 PAD = INPUTS  # feature index for empty slots
 QA, QB, SCALE = 255, 64, 400
 RECORD = np.dtype([("sq", "u1", 32), ("pc", "u1", 32), ("score", "<i2"), ("result", "u1"), ("stm", "u1")])
+CHUNK = 1 << 20      # positions read from one file at a time
+MIX = 8              # chunks shuffled together
+VAL_TOTAL = 100_000  # validation positions, taken from the tail of every file
 
 
-def all_features(data, perspective, chunk=1 << 20):
-    """features() for the whole dataset, built in chunks and stored as int16 to keep memory down."""
-    out = np.empty((len(data), 32), dtype=np.int16)
-    for i in range(0, len(data), chunk):
-        out[i : i + chunk] = features(data[i : i + chunk], perspective[i : i + chunk])
-    return torch.from_numpy(out)
+class Batchify:
+    """Turns raw records (numpy) into feature indices and targets on the training device."""
 
+    def __init__(self, device, lam, lam_eg, eg_pieces):
+        self.device, self.lam, self.lam_eg, self.eg_pieces = device, lam, lam_eg, eg_pieces
 
-def features(data, perspective):
-    """[N, 32] feature indices from `perspective` (array of 0 = White / 1 = Black per position)."""
-    sq = data["sq"].astype(np.int64)
-    pc = data["pc"].astype(np.int64)
-    empty = pc == 0xFF
-    color, ptype = pc >> 3, pc & 7
-    persp = perspective[:, None].astype(np.int64)
-    square = np.where(persp == 0, sq, sq ^ 56)
-    idx = np.where(color == persp, 0, 384) + (ptype - 1) * 64 + square
-    idx[empty] = PAD
-    return idx
+    def __call__(self, rec):
+        rec = rec[np.abs(rec["score"]) < 2000]
+        d = self.device
+        sq = torch.from_numpy(np.ascontiguousarray(rec["sq"])).to(d, non_blocking=True).long()
+        pc = torch.from_numpy(np.ascontiguousarray(rec["pc"])).to(d, non_blocking=True).long()
+        stm = torch.from_numpy(np.ascontiguousarray(rec["stm"])).to(d, non_blocking=True).long()
+        score = torch.from_numpy(np.ascontiguousarray(rec["score"])).to(d, non_blocking=True).float()
+        result = torch.from_numpy(np.ascontiguousarray(rec["result"])).to(d, non_blocking=True).float() / 2
+
+        empty = pc == 0xFF
+        color, ptype = pc >> 3, pc & 7
+
+        def feats(persp):
+            p = persp[:, None]
+            square = torch.where(p == 0, sq, sq ^ 56)
+            idx = (color != p).long() * 384 + (ptype - 1) * 64 + square
+            return idx.masked_fill(empty, PAD)
+
+        us, them = feats(stm), feats(1 - stm)
+        lam = torch.full_like(score, self.lam)
+        if self.lam_eg is not None:
+            pieces = (~empty).sum(dim=1)
+            lam = torch.where(pieces <= self.eg_pieces, torch.full_like(score, self.lam_eg), lam)
+        target = lam * torch.sigmoid(score / SCALE) + (1 - lam) * result
+        return us, them, target
 
 
 class Net(torch.nn.Module):
@@ -59,11 +82,11 @@ class Net(torch.nn.Module):
 
 
 def export(net, path):
-    w = net.ft.weight.detach().numpy()[:INPUTS]
+    w = net.ft.weight.detach().cpu().numpy()[:INPUTS]
     ft_w = np.clip(np.round(w * QA), -32768, 32767).astype("<i2")
-    ft_b = np.clip(np.round(net.ft_bias.detach().numpy() * QA), -32768, 32767).astype("<i2")
-    out_w = np.clip(np.round(net.out.weight.detach().numpy()[0] * QB), -32768, 32767).astype("<i2")
-    out_b = int(round(float(net.out.bias.detach()[0]) * QA * QB))
+    ft_b = np.clip(np.round(net.ft_bias.detach().cpu().numpy() * QA), -32768, 32767).astype("<i2")
+    out_w = np.clip(np.round(net.out.weight.detach().cpu().numpy()[0] * QB), -32768, 32767).astype("<i2")
+    out_b = int(round(float(net.out.bias.detach().cpu()[0]) * QA * QB))
     with open(path, "wb") as f:
         f.write(b"CBNN" + struct.pack("<i", HIDDEN))
         f.write(ft_w.tobytes() + ft_b.tobytes() + out_w.tobytes() + struct.pack("<i", out_b))
@@ -75,50 +98,65 @@ def main():
     ap.add_argument("data", nargs="+")
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--lambda", dest="lam", type=float, default=0.7)
+    ap.add_argument("--lambda-endgame", dest="lam_eg", type=float, default=None,
+                    help="lambda for positions with at most --endgame-pieces pieces (default: same as --lambda)")
+    ap.add_argument("--endgame-pieces", type=int, default=10)
     ap.add_argument("--batch", type=int, default=16384)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--hidden", type=int, default=256)
+    ap.add_argument("--init", help="start from this .pt state dict (same --hidden) instead of random weights")
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--seed", type=int, default=1)
     args = ap.parse_args()
     global HIDDEN
     HIDDEN = args.hidden
+    torch.manual_seed(args.seed)
+    rng = np.random.default_rng(args.seed)
+    device = torch.device(args.device)
 
-    data = np.concatenate([np.fromfile(p, dtype=RECORD) for p in args.data])
-    data = data[np.abs(data["score"]) < 2000]
-    print(f"{len(data)} positions", flush=True)
-    stm = data["stm"].astype(np.int64)
-    us = all_features(data, stm)
-    them = all_features(data, 1 - stm)
-    score_t = torch.sigmoid(torch.from_numpy(data["score"].astype(np.float32)) / SCALE)
-    result_t = torch.from_numpy(data["result"].astype(np.float32)) / 2
-    target = args.lam * score_t + (1 - args.lam) * result_t
+    # Memory-map every file; the last few positions of each are held out for validation.
+    files = [np.memmap(p, dtype=RECORD, mode="r", shape=(np.memmap(p, dtype="u1", mode="r").size // RECORD.itemsize,))
+             for p in args.data]
+    total = sum(len(f) for f in files)
+    per_file_val = math.ceil(VAL_TOTAL / len(files))
+    train_end = [max(0, len(f) - min(per_file_val, len(f) // 20)) for f in files]
+    chunks = [(i, s, min(s + CHUNK, end)) for i, end in enumerate(train_end) for s in range(0, end, CHUNK)]
+    batchify = Batchify(device, args.lam, args.lam_eg, args.endgame_pieces)
+    val = batchify(np.concatenate([np.asarray(f[e:]) for f, e in zip(files, train_end)]))
+    print(f"{total} positions in {len(files)} files, {len(val[2])} for validation, device {device}", flush=True)
 
-    n = len(data)
-    val = torch.randperm(n)[: min(50000, n // 20)]
-    train_mask = torch.ones(n, dtype=torch.bool)
-    train_mask[val] = False
-    train = torch.nonzero(train_mask).squeeze(1)
-
-    net = Net()
+    net = Net().to(device)
+    if args.init:
+        net.load_state_dict(torch.load(args.init, map_location=device))
+        print(f"initialised from {args.init}", flush=True)
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
+
     for epoch in range(args.epochs):
         t0 = time.time()
-        perm = train[torch.randperm(len(train))]
-        total = 0.0
-        for i in range(0, len(perm), args.batch):
-            idx = perm[i : i + args.batch]
-            pred = torch.sigmoid(net(us[idx].long(), them[idx].long()))
-            loss = torch.mean((pred - target[idx]) ** 2)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            with torch.no_grad():
-                net.ft.weight[PAD].zero_()
-            total += loss.item() * len(idx)
+        order = rng.permutation(len(chunks))
+        loss_sum, seen = 0.0, 0
+        for g in range(0, len(order), MIX):
+            rec = np.concatenate([np.asarray(files[i][s:e]) for i, s, e in (chunks[k] for k in order[g:g + MIX])])
+            rec = rec[rng.permutation(len(rec))]
+            for b in range(0, len(rec), args.batch):
+                us, them, target = batchify(rec[b:b + args.batch])
+                if not len(target):
+                    continue
+                loss = torch.mean((torch.sigmoid(net(us, them)) - target) ** 2)
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+                with torch.no_grad():
+                    net.ft.weight[PAD].zero_()
+                loss_sum += loss.item() * len(target)
+                seen += len(target)
         sched.step()
         with torch.no_grad():
-            vloss = torch.mean((torch.sigmoid(net(us[val].long(), them[val].long())) - target[val]) ** 2).item()
-        print(f"epoch {epoch + 1}/{args.epochs}  train {total / len(perm):.5f}  val {vloss:.5f}  "
+            vl = [torch.sum((torch.sigmoid(net(val[0][i:i + 65536], val[1][i:i + 65536])) - val[2][i:i + 65536]) ** 2)
+                  for i in range(0, len(val[2]), 65536)]
+            vloss = (sum(vl) / len(val[2])).item()
+        print(f"epoch {epoch + 1}/{args.epochs}  train {loss_sum / max(seen, 1):.5f}  val {vloss:.5f}  "
               f"{time.time() - t0:.0f}s", flush=True)
         export(net, args.out)  # keep the latest network on disk
         torch.save(net.state_dict(), args.out + ".pt")
