@@ -257,7 +257,7 @@ static_assert(sizeof(PackedPos) == 68, "PackedPos layout");
 }  // namespace
 
 // Self-play games at a fixed node count per move, starting from random 8-9 ply openings. Writes quiet
-// positions (not in check, best move not a capture or promotion, no mate score) with the engine's score and
+// positions (not in check, best move not a capture or promotion, no mate score, 50-move counter at most 30) with the engine's score and
 // the final result. Games end by the rules, by tablebase, by agreement on a +-20 pawn score, or at 400 plies.
 int selfplay(const std::string& out, int games, int nodes, unsigned seed) {
     tb::loadOrGenerateAll(nullptr);
@@ -311,7 +311,9 @@ int selfplay(const std::string& out, int games, int nodes, unsigned seed) {
                 whiteResult = (score > 0) == (b.stm == WHITE) ? 1 : 0;
                 break;
             }
-            if (!b.inCheck() && !isCapture(m) && !movePromo(m) && std::abs(score) < 2000) {
+            // Scores fade with the 50-move counter (see fiftyMoveScale in eval.cpp), which the network cannot
+            // see, so positions deep into a quiet stretch would teach it shrunken scores. Skip them.
+            if (!b.inCheck() && !isCapture(m) && !movePromo(m) && std::abs(score) < 2000 && b.halfmove <= 30) {
                 PackedPos p;
                 std::memset(&p, 0xFF, sizeof(p));
                 int k = 0;
