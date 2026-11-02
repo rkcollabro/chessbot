@@ -35,6 +35,10 @@ void* allocLargePages(size_t bytes, bool& large) {
     return VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);  // zeroed by the OS
 }
 
+void freeLargePages(void* p) {
+    if (p) VirtualFree(p, 0, MEM_RELEASE);
+}
+
 #else
 #include <cstdlib>
 #include <cstring>
@@ -54,4 +58,6 @@ void* allocLargePages(size_t bytes, bool& large) {
     std::memset(p, 0, size);
     return p;
 }
+
+void freeLargePages(void* p) { std::free(p); }
 #endif

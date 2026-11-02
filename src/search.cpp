@@ -38,10 +38,16 @@ struct TTData {
     int score, depth, flag;
 };
 
-constexpr size_t TT_SIZE = size_t(1) << 22;  // 64 MB
+// The size is a power of two (the UCI "Hash" option rounds down to one); TT_DEFAULT_MB until set. Tests
+// change the default at build time (-DTT_DEFAULT_MB=...) to compare table sizes without UCI options.
+#ifndef TT_DEFAULT_MB
+#define TT_DEFAULT_MB 64
+#endif
+size_t g_ttSize = (size_t(TT_DEFAULT_MB) << 20) / sizeof(TTEntry);
+size_t g_ttMask = g_ttSize - 1;
 bool g_ttLarge = false;
 // All-zero bytes are an empty entry, which is what allocLargePages hands back.
-TTEntry* const g_tt = static_cast<TTEntry*>(allocLargePages(TT_SIZE * sizeof(TTEntry), g_ttLarge));
+TTEntry* g_tt = static_cast<TTEntry*>(allocLargePages(g_ttSize * sizeof(TTEntry), g_ttLarge));
 
 inline uint64_t ttPack(Move m, int score, int depth, int flag) {
     return uint64_t(m & 0xFFFFF) | (uint64_t(uint16_t(score + 32768)) << 20) | (uint64_t(depth & 0xFF) << 36) |
@@ -52,14 +58,14 @@ inline uint64_t ttPack(Move m, int score, int depth, int flag) {
 // follows a few hundred instructions later doesn't stall on main memory.
 inline void ttPrefetch(uint64_t key) {
 #ifdef _MSC_VER
-    _mm_prefetch((const char*)&g_tt[key & (TT_SIZE - 1)], _MM_HINT_T0);
+    _mm_prefetch((const char*)&g_tt[key & g_ttMask], _MM_HINT_T0);
 #else
-    __builtin_prefetch(&g_tt[key & (TT_SIZE - 1)]);
+    __builtin_prefetch(&g_tt[key & g_ttMask]);
 #endif
 }
 
 bool ttProbe(uint64_t key, TTData& d) {
-    TTEntry& e = g_tt[key & (TT_SIZE - 1)];
+    TTEntry& e = g_tt[key & g_ttMask];
     uint64_t data = e.data.load(std::memory_order_relaxed);
     if ((e.keyXor.load(std::memory_order_relaxed) ^ data) != key || !data) return false;
     d.move = Move(data & 0xFFFFF);
@@ -70,7 +76,7 @@ bool ttProbe(uint64_t key, TTData& d) {
 }
 
 void ttStore(uint64_t key, Move m, int score, int depth, int flag) {
-    TTEntry& e = g_tt[key & (TT_SIZE - 1)];
+    TTEntry& e = g_tt[key & g_ttMask];
     uint64_t old = e.data.load(std::memory_order_relaxed);
     bool same = (e.keyXor.load(std::memory_order_relaxed) ^ old) == key;
     if (same) {
@@ -831,8 +837,26 @@ int quiescenceScore(const Board& pos) {
 
 bool hashOnLargePages() { return g_ttLarge; }
 
+void setHashSize(int mb) {
+    const size_t bytes = size_t(std::max(1, mb)) << 20;
+    size_t entries = 1;
+    while (entries * 2 * sizeof(TTEntry) <= bytes) entries *= 2;
+    if (entries == g_ttSize) return;
+    // Free first: large pages need contiguous physical memory, and the old table would fragment it.
+    freeLargePages(g_tt);
+    g_tt = static_cast<TTEntry*>(allocLargePages(entries * sizeof(TTEntry), g_ttLarge));
+    if (!g_tt) {  // out of memory: fall back to the default size
+        entries = size_t(1) << 22;
+        g_tt = static_cast<TTEntry*>(allocLargePages(entries * sizeof(TTEntry), g_ttLarge));
+    }
+    g_ttSize = entries;
+    g_ttMask = entries - 1;
+}
+
+size_t hashSizeMB() { return (g_ttSize * sizeof(TTEntry)) >> 20; }
+
 void clearSearchMemory() {
-    for (size_t i = 0; i < TT_SIZE; i++) {
+    for (size_t i = 0; i < g_ttSize; i++) {
         g_tt[i].keyXor.store(0, std::memory_order_relaxed);
         g_tt[i].data.store(0, std::memory_order_relaxed);
     }

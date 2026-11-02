@@ -70,6 +70,7 @@ void uciLoop(const std::string& tbDir, const std::string& bookPath) {
             std::printf("option name Ponder type check default false\n");
             std::printf("option name UseNNUE type check default true\n");
             std::printf("option name Threads type spin default 1 min 1 max 64\n");
+            std::printf("option name Hash type spin default 64 min 1 max 8192\n");
             std::printf("option name Level type spin default 6 min 1 max 6\n");
             std::printf("option name LevelNodes type spin default -1 min -1 max 100000000\n");
             std::printf("option name LevelNoise type spin default -1 min -1 max 1000\n");
@@ -86,6 +87,11 @@ void uciLoop(const std::string& tbDir, const std::string& bookPath) {
             if (name == "OwnBook") ownBook = value == "true";
             if (name == "UseNNUE") nnue::setEnabled(value == "true");
             if (name == "Threads") threads = std::max(1, std::atoi(value.c_str()));
+            if (name == "Hash") {
+                join();  // no search may be using the table while it moves
+                setHashSize(std::atoi(value.c_str()));
+                std::printf("info string hash %zu MB%s\n", hashSizeMB(), hashOnLargePages() ? " (large pages)" : "");
+            }
             if (name == "Level") level = std::max(1, std::min(6, std::atoi(value.c_str())));
             if (name == "LevelNodes") levelNodes = std::atoi(value.c_str());
             if (name == "LevelNoise") levelNoise = std::atoi(value.c_str());

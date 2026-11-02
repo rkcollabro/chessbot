@@ -49,4 +49,6 @@ Move findBestMove(const Board& root, int timeMs, std::atomic<bool>* stop, const 
 int quiescenceScore(const Board& pos);
 void clearSearchMemory();
 bool hashOnLargePages();  // whether the transposition table got large pages
+void setHashSize(int mb);  // resize (and clear) the transposition table; rounds down to a power of two
+size_t hashSizeMB();
 std::string scoreToString(int score);  // "+0.35", "M4", "-M2"
