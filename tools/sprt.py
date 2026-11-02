@@ -62,9 +62,9 @@ def play(engines, opening, tc):
     return board.result(claim_draw=True)
 
 
-def open_engine(path):
+def open_engine(path, book=False):
     e = chess.engine.SimpleEngine.popen_uci([os.path.abspath(path), "uci"])
-    e.configure({"OwnBook": False, "Threads": 1})
+    e.configure({"OwnBook": book, "Threads": 1})
     return e
 
 
@@ -100,9 +100,15 @@ def main():
     ap.add_argument("--offset", type=int, default=0, help="index of the first opening")
     ap.add_argument("--json", help="write W/L/D and per-pair scores here")
     ap.add_argument("--openings", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "openings.txt"))
+    ap.add_argument("--book", choices=["none", "cand", "base", "both"], default="none",
+                    help="which side plays from its own opening book (book.bin next to the exe); with a book in "
+                         "play every game starts from the initial position instead of the opening suite")
     args = ap.parse_args()
     tc = tuple(float(x) for x in args.tc.split("+"))
-    openings = [l.strip() for l in open(args.openings) if l.strip()]
+    if args.book == "none":
+        openings = [l.strip() for l in open(args.openings) if l.strip()]
+    else:
+        openings = [""]  # start position: the book (or the search) chooses the opening
     lower, upper = math.log(BETA / (1 - ALPHA)), math.log((1 - BETA) / ALPHA)
 
     pairs, wdl = [], [0, 0, 0]
@@ -116,7 +122,8 @@ def main():
         if done.is_set():
             return
         if not hasattr(local, "cand"):
-            local.cand, local.base = open_engine(args.candidate), open_engine(args.base)
+            local.cand = open_engine(args.candidate, args.book in ("cand", "both"))
+            local.base = open_engine(args.base, args.book in ("base", "both"))
         opening = openings[(args.offset + i) % len(openings)]
         points = 0.0
         for cand_white in (True, False):

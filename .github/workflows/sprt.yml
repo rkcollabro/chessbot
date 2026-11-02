@@ -4,7 +4,7 @@
 # better than elo0). Otherwise the round dispatches the next one, up to max_rounds.
 # Each revision is built from its own source and plays with the nnue.bin committed in that revision.
 name: SPRT
-run-name: SPRT ${{ inputs.candidate }} vs ${{ inputs.base }} (round ${{ inputs.round }})
+run-name: SPRT ${{ inputs.candidate }} vs ${{ inputs.base }}${{ inputs.book && inputs.book != 'none' && format(' (book {0})', inputs.book) || '' }} (round ${{ inputs.round }})
 
 on:
   workflow_dispatch:
@@ -34,6 +34,11 @@ on:
       base_flags:
         description: Extra compiler flags for the base
         default: ""
+      book:
+        description: Side that plays from its opening book (games then start from the initial position)
+        type: choice
+        options: [none, cand, base, both]
+        default: none
       round:
         description: Round number (set by the previous round; leave at 1)
         default: "1"
@@ -102,6 +107,7 @@ jobs:
             mkdir -p "eng/$side"
             sh tools/ci_build.sh "/tmp/$side/src" "eng/$side/chesscli" $flags
             [ -f "/tmp/$side/nnue.bin" ] && cp "/tmp/$side/nnue.bin" "eng/$side/"
+            [ -f "/tmp/$side/book.bin" ] && cp "/tmp/$side/book.bin" "eng/$side/"
             ln -s "$PWD/tb" "eng/$side/tb"
           done
       - name: Play
@@ -112,7 +118,7 @@ jobs:
           # Every round and shard starts at its own opening, so later rounds move on through the book.
           offset=$(( ((ROUND - 1) * JOBS * PAIRS + ${{ matrix.shard }} * PAIRS) % 3000 ))
           python3 tools/sprt.py eng/cand/chesscli eng/base/chesscli --fixed "$PAIRS" --offset "$offset" \
-            --tc "$TC" --concurrency 4 --json "result-${{ matrix.shard }}.json"
+            --tc "$TC" --concurrency 4 --book "${{ inputs.book || 'none' }}" --json "result-${{ matrix.shard }}.json"
       - uses: actions/upload-artifact@v4
         with:
           name: result-${{ matrix.shard }}
@@ -162,5 +168,5 @@ jobs:
             -f candidate="${{ inputs.candidate }}" -f base="${{ inputs.base }}" -f tc="${{ inputs.tc }}" \
             -f elo0="${{ inputs.elo0 }}" -f elo1="${{ inputs.elo1 }}" -f max_rounds="${{ inputs.max_rounds }}" \
             -f candidate_flags="${{ inputs.candidate_flags }}" -f base_flags="${{ inputs.base_flags }}" \
-            -f round="$(( ${{ inputs.round }} + 1 ))" -f prev_run="${{ github.run_id }}"
+            -f book="${{ inputs.book || 'none' }}" -f round="$(( ${{ inputs.round }} + 1 ))" -f prev_run="${{ github.run_id }}"
           echo "Round $(( ${{ inputs.round }} + 1 )) dispatched." >> "$GITHUB_STEP_SUMMARY"
