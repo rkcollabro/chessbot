@@ -115,6 +115,7 @@ constexpr bool F_CONT = SF & 1, F_CAP = SF & 2, F_NPCORR = SF & 4, F_RAZOR = SF 
                F_QSFUT = SF & 32, F_HISTPRUNE = SF & 64, F_EXT = SF & 128, F_TTCAP = SF & 256;
 
 // Search parameters, overridable at build time (-DNAME=value) so each setting can be tested against master.
+// Values tuned by SPSA (30k games, 2026-11-02; +7.2 Elo vs the hand-set values in a 6000-game SPRT).
 // The defaults reproduce master exactly; razoring, ProbCut and history pruning only apply when enabled in
 // SEARCH_FEATURES.
 #ifndef RAZOR_DEPTH
@@ -139,49 +140,49 @@ constexpr bool F_CONT = SF & 1, F_CAP = SF & 2, F_NPCORR = SF & 4, F_RAZOR = SF 
 #define HP_MULT 2000
 #endif
 #ifndef RFP_MARGIN
-#define RFP_MARGIN 85
+#define RFP_MARGIN 80
 #endif
 #ifndef FUT_BASE
-#define FUT_BASE 100
+#define FUT_BASE 106
 #endif
 #ifndef FUT_MULT
 #define FUT_MULT 90
 #endif
 #ifndef LMR_BASE
-#define LMR_BASE 75  // hundredths
+#define LMR_BASE 83  // hundredths
 #endif
 #ifndef LMR_DIV
-#define LMR_DIV 225  // hundredths
+#define LMR_DIV 221  // hundredths
 #endif
 #ifndef NODE_TM
 #define NODE_TM 0  // 1: also scale the time target by the share of nodes spent on the best root move
 #endif
 #ifndef NMP_EVAL
-#define NMP_EVAL 200  // null-move reduction grows by one per this much eval above beta (up to 3)
+#define NMP_EVAL 183  // null-move reduction grows by one per this much eval above beta (up to 3)
 #endif
 #ifndef SEE_QUIET
-#define SEE_QUIET 60  // SEE pruning thresholds per depth
+#define SEE_QUIET 61  // SEE pruning thresholds per depth
 #endif
 #ifndef SEE_CAP
-#define SEE_CAP 90
+#define SEE_CAP 83
 #endif
 #ifndef DEXT_MARGIN
-#define DEXT_MARGIN 25  // singular-search margin below which the TT move gets a double extension
+#define DEXT_MARGIN 26  // singular-search margin below which the TT move gets a double extension
 #endif
 #ifndef LMR_HIST
-#define LMR_HIST 12000  // history per ply of LMR adjustment
+#define LMR_HIST 10386  // history per ply of LMR adjustment
 #endif
 #ifndef HIST_MULT
-#define HIST_MULT 16  // history bonus: min(HIST_MULT * depth^2, HIST_MAX)
+#define HIST_MULT 18  // history bonus: min(HIST_MULT * depth^2, HIST_MAX)
 #endif
 #ifndef HIST_MAX
-#define HIST_MAX 1600
+#define HIST_MAX 1659
 #endif
 #ifndef ASP_DELTA
-#define ASP_DELTA 25  // initial aspiration window half-width
+#define ASP_DELTA 24  // initial aspiration window half-width
 #endif
 #ifndef QS_FUT
-#define QS_FUT 150  // qsearch futility margin
+#define QS_FUT 142  // qsearch futility margin
 #endif
 
 // With -DTUNE the parameters become UCI options (for SPSA); otherwise they are compile-time constants.
