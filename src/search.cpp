@@ -189,6 +189,22 @@ bool hasVariantWinNow(Board& b) {
     return false;
 }
 
+// A position the variant rules have already decided: sets its score (side to move's view) and returns true.
+bool variantDecided(const Board& b, int ply, int& score) {
+    int o = b.variantOutcome();
+    // Racing kings: White is home and Black, to move, can still get there. Black will (anything else loses),
+    // so the position is a draw already.
+    if (!o && b.variant == RACING_KINGS && b.stm == BLACK && rankOf(b.kingSq[WHITE]) == 7) o = OUTCOME_DRAW;
+    if (!o) return false;
+    score = o == OUTCOME_LOSS ? -MATE + ply : o == OUTCOME_WIN ? MATE - ply : 0;
+    return true;
+}
+
+// Racing kings: a king stepping home is as forcing as a capture, so the quiescence search looks at it too.
+inline bool isRaceFinish(const Board& b, Move m) {
+    return b.variant == RACING_KINGS && !isCapture(m) && typeOf(b.sq[moveFrom(m)]) == KING && rankOf(moveTo(m)) == 7;
+}
+
 using Clock = std::chrono::steady_clock;
 
 // State shared by all threads of one search.
@@ -344,7 +360,7 @@ public:
         if ((++nodes & 1023) == 0) checkTime();
         if (maxNodes && nodes >= maxNodes && iterDepth > 1) stopped = true;
         if (stopped) return 0;
-        if (b.variantOutcome()) return -MATE + ply;
+        if (int vs; b.variant != STANDARD && variantDecided(b, ply, vs)) return vs;
         if (b.pieceCount <= 4 && tablebaseRules(b)) {
             int v;
             if (tb::probe(b, v)) return tbScore(v, ply);
@@ -373,12 +389,17 @@ public:
         b.genMoves(ml, !inCheck);
         int scores[MAX_MOVES];
         for (int i = 0; i < ml.count; i++) scores[i] = scoreMove(ml.moves[i], ttMove, ply, NO_MOVE);
+        if (b.variant == RACING_KINGS)
+            for (int i = 0; i < ml.count; i++)
+                if (isRaceFinish(b, ml.moves[i])) scores[i] = 2000000;
         int legal = 0;
         Move bestMove = NO_MOVE;
         for (int i = 0; i < ml.count; i++) {
             pickMove(ml, scores, i);
             Move m = ml.moves[i];
-            if (!inCheck) {
+            if (!inCheck && isRaceFinish(b, m)) {
+                // searched like a capture, whatever its history score
+            } else if (!inCheck) {
                 if (!isCapture(m) && !movePromo(m)) continue;  // a stale TT move may be quiet
                 // Losing captures and underpromotions are sorted last: nothing useful remains.
                 if (scores[i] < 0) break;
@@ -417,7 +438,7 @@ public:
         const Move excludedMove = excluded[ply];
 
         if (!root) {
-            if (b.variantOutcome()) return -MATE + ply;
+            if (int vs; b.variant != STANDARD && variantDecided(b, ply, vs)) return vs;
             if (b.halfmove >= 100 || b.isRepetition() || b.insufficientMaterial()) return 0;
             if (b.pieceCount <= 4 && tablebaseRules(b)) {
                 int v;

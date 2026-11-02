@@ -10,12 +10,15 @@
 enum Color : int { WHITE = 0, BLACK = 1 };
 
 // Rule sets. Standard and Chess960 share everything except the start position and castling setup.
-enum Variant : int { STANDARD = 0, CHESS960, THREE_CHECK, CRAZYHOUSE, KING_OF_THE_HILL, HORDE, NUM_VARIANTS };
+enum Variant : int {
+    STANDARD = 0, CHESS960, THREE_CHECK, CRAZYHOUSE, KING_OF_THE_HILL, HORDE, RACING_KINGS, NUM_VARIANTS
+};
 const char* variantName(int v);     // "Three-check"
 const char* variantUciName(int v);  // "3check", as UCI_Variant / lichess name it
 int variantFromUciName(const std::string& s);  // -1 if unknown
 std::string variantStartFEN(int v);
 std::string chess960StartFEN(int n);  // Scharnagl numbering 0..959; 518 is the standard position
+constexpr int OUTCOME_LOSS = -1, OUTCOME_WIN = 1, OUTCOME_DRAW = 2;  // Board::variantOutcome()
 enum PieceType : int { NO_TYPE = 0, PAWN = 1, KNIGHT = 2, BISHOP = 3, ROOK = 4, QUEEN = 5, KING = 6 };
 
 // Piece code = type | color << 3. White pieces are 1..6, black 9..14, 0 is empty.
@@ -181,9 +184,11 @@ public:
     void makeNull();
     void unmakeNull();
 
-    // Game won or lost by a variant rule (three checks, king on the hill, horde wiped out):
-    // -1 if the side to move has lost, 0 otherwise. Checkmate and stalemate are not included.
+    // Game decided by a variant rule (three checks, king on the hill, horde wiped out, a king home in the race):
+    // OUTCOME_LOSS / OUTCOME_WIN for the side to move, OUTCOME_DRAW, or 0 while the game goes on.
+    // Checkmate and stalemate are not included. Any non-zero value means the game is over.
     int variantOutcome() const;
+    bool raceKingCanFinish() const;  // racing kings: the side to move's king can legally step onto the 8th rank
     std::string variantOutcomeText() const;  // "White wins by three checks", or empty
 
     bool isRepetition() const;

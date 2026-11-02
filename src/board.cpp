@@ -230,12 +230,12 @@ void initTables() {
 }
 
 const char* variantName(int v) {
-    static const char* N[] = {"Standard", "Chess960", "Three-check", "Crazyhouse", "King of the Hill", "Horde"};
+    static const char* N[] = {"Standard", "Chess960", "Three-check", "Crazyhouse", "King of the Hill", "Horde", "Racing Kings"};
     return v >= 0 && v < NUM_VARIANTS ? N[v] : "?";
 }
 
 const char* variantUciName(int v) {
-    static const char* N[] = {"chess", "chess960", "3check", "crazyhouse", "kingofthehill", "horde"};
+    static const char* N[] = {"chess", "chess960", "3check", "crazyhouse", "kingofthehill", "horde", "racingkings"};
     return v >= 0 && v < NUM_VARIANTS ? N[v] : "?";
 }
 
@@ -247,6 +247,7 @@ int variantFromUciName(const std::string& s) {
     if (l == "standard" || l == "normal") return STANDARD;
     if (l == "threecheck" || l == "three-check") return THREE_CHECK;
     if (l == "koth" || l == "king of the hill") return KING_OF_THE_HILL;
+    if (l == "racing kings" || l == "racing-kings" || l == "racingkings") return RACING_KINGS;
     return -1;
 }
 
@@ -255,6 +256,7 @@ std::string variantStartFEN(int v) {
         case THREE_CHECK: return "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 3+3 0 1";
         case CRAZYHOUSE: return "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1";
         case HORDE: return "rnbqkbnr/pppppppp/8/1PP2PP1/PPPPPPPP/PPPPPPPP/PPPPPPPP/PPPPPPPP w kq - 0 1";
+        case RACING_KINGS: return "8/8/8/8/8/8/krbnNBRK/qrbnNBRQ w - - 0 1";
         default: return "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
     }
 }
@@ -640,6 +642,10 @@ void Board::genMoves(MoveList& ml, bool capturesOnly) const {
         }
     }
 
+    // Racing kings: a king stepping onto the 8th rank decides the game, so tactical searches need it too.
+    if (capturesOnly && variant == RACING_KINGS)
+        for (Bitboard a = KING_ATT[kingSq[us]] & rankMask(7) & empty; a;) ml.add(encodeMove(kingSq[us], popLsb(a)));
+
     // Castling (also Chess960): the king goes to the g- or c-file and the rook next to it. Every square
     // either piece crosses must be empty apart from those two, and the king may not pass through check.
     if (!capturesOnly && (castle & (us == WHITE ? 3 : 12))) {
@@ -769,6 +775,10 @@ bool Board::makeMove(Move m) {
         unmakeMove();
         return false;
     }
+    if (variant == RACING_KINGS && inCheck()) {  // racing kings: giving check is illegal
+        unmakeMove();
+        return false;
+    }
     if (variant == THREE_CHECK && inCheck()) {
         int mover = stm ^ 1;
         hash ^= Z_checks[mover][checks[mover]];
@@ -849,17 +859,43 @@ void Board::unmakeNull() {
 int Board::variantOutcome() const {
     const int them = stm ^ 1;
     switch (variant) {
-        case THREE_CHECK: return checks[them] >= 3 ? -1 : 0;
-        case KING_OF_THE_HILL: return kingSq[them] >= 0 && (bit(kingSq[them]) & CENTER) ? -1 : 0;
-        case HORDE: return occ[stm] ? 0 : -1;
+        case THREE_CHECK: return checks[them] >= 3 ? OUTCOME_LOSS : 0;
+        case KING_OF_THE_HILL: return kingSq[them] >= 0 && (bit(kingSq[them]) & CENTER) ? OUTCOME_LOSS : 0;
+        case HORDE: return occ[stm] ? 0 : OUTCOME_LOSS;
+        case RACING_KINGS: {
+            // First king to the 8th rank wins, except that White moves first: when White gets there, Black
+            // has one more move, and reaching the 8th rank with it draws.
+            const bool whiteHome = rankOf(kingSq[WHITE]) == 7, blackHome = rankOf(kingSq[BLACK]) == 7;
+            if (whiteHome && blackHome) return OUTCOME_DRAW;
+            if (blackHome) return stm == BLACK ? OUTCOME_WIN : OUTCOME_LOSS;
+            if (!whiteHome) return 0;
+            if (stm == WHITE) return OUTCOME_WIN;
+            return raceKingCanFinish() ? 0 : OUTCOME_LOSS;
+        }
         default: return 0;
     }
 }
 
+bool Board::raceKingCanFinish() const {
+    Board& b = const_cast<Board&>(*this);  // makeMove/unmakeMove leave the position exactly as it was
+    const int k = kingSq[stm];
+    for (Bitboard to = attacks::king(k) & rankMask(7) & ~occ[stm]; to;) {
+        int t = popLsb(to);
+        if (b.makeMove(encodeMove(k, t, 0, sq[t] ? MF_CAPTURE : 0))) {
+            b.unmakeMove();
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string Board::variantOutcomeText() const {
-    if (!variantOutcome()) return {};
-    std::string winner = stm == WHITE ? "Black" : "White";
+    const int o = variantOutcome();
+    if (!o) return {};
+    if (o == OUTCOME_DRAW) return "Draw - both kings reached the 8th rank";
+    std::string winner = (stm == WHITE) == (o == OUTCOME_LOSS) ? "Black" : "White";
     switch (variant) {
+        case RACING_KINGS: return winner + " wins the race";
         case THREE_CHECK: return winner + " wins by three checks";
         case KING_OF_THE_HILL: return winner + " wins - king reached the center";
         default: return "Black wins - the horde is destroyed";

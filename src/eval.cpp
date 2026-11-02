@@ -243,6 +243,22 @@ int variantTerms(const Board& b) {
                 // without this the 36 pawns look about 7 pawns worse than Black's army at the start.
                 if (c == WHITE) score += 20 * popcount(b.bb(WHITE, PAWN));
                 break;
+            case RACING_KINGS: {
+                // Both kings race up the board, so progress counts by rank for both colors. Squares on the
+                // rank ahead that the opponent controls slow the king down; if all of them are covered it is stuck.
+                static const int RACE[8] = {0, 30, 75, 140, 230, 350, 520, 0};
+                const int r = rankOf(k);
+                score += sign * RACE[r];
+                if (r < 7) {
+                    Bitboard ahead = attacks::king(k) & rankMask(r + 1) & ~b.occ[c];
+                    int open = 0, total = popcount(ahead);
+                    for (Bitboard a = ahead; a;)
+                        if (!b.attacked(popLsb(a), e)) open++;
+                    score -= sign * (total - open) * (15 + 5 * r);
+                    if (!open) score -= sign * (40 + 15 * r);
+                }
+                break;
+            }
             default: break;
         }
     }
