@@ -213,4 +213,5 @@ private:
 };
 
 void initTables();
+bool checkMagics();  // magic slider attacks agree with the classical ray scan
 std::string squareName(int s);

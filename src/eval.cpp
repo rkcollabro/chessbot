@@ -251,8 +251,18 @@ int variantTerms(const Board& b) {
 
 }  // namespace
 
+namespace {
+// Fade the score toward a draw as the 50-move counter climbs (full value at 0, half at 100). The network
+// cannot see the counter, so without this a won position scores the same whether the engine makes progress
+// or shuffles, and the search only notices once the forced draw at 100 is inside its horizon.
+int fiftyMoveScale(const Board& b, int score) {
+    return score * (200 - b.halfmove) / 200;
+}
+}  // namespace
+
 int evaluate(const Board& b) {
-    if ((b.variant == STANDARD || b.variant == CHESS960) && nnue::active()) return nnue::evaluate(b);
+    if ((b.variant == STANDARD || b.variant == CHESS960) && nnue::active())
+        return fiftyMoveScale(b, nnue::evaluate(b));
     ScoreAcc acc;
     int phase = evalCore(b, acc);
     int score = (acc.mg * phase + acc.eg * (MAX_PHASE - phase)) / MAX_PHASE;
@@ -261,7 +271,7 @@ int evaluate(const Board& b) {
         adjust(b, score);
     else
         score += variantTerms(b);
-    return b.stm == WHITE ? score : -score;
+    return fiftyMoveScale(b, b.stm == WHITE ? score : -score);
 }
 
 void traceEval(const Board& b, EvalTrace& t) {
