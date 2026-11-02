@@ -22,11 +22,15 @@ import sys
 import threading
 import time
 
-import chess
-import chess.engine
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sprt import play as play_game  # noqa: E402
+
+# python-chess is only needed for playing; the update step runs without it.
+try:
+    import chess
+    import chess.engine
+    from sprt import play as play_game
+except ImportError:
+    chess = None
 
 
 def read_spec(path):

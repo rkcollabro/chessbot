@@ -29,6 +29,9 @@ on:
       prev_run:
         description: Run id of the previous round (set by the previous round; leave empty)
         default: ""
+      theta:
+        description: Starting theta.json contents, used when prev_run is empty (default = the engine's values)
+        default: ""
 
 permissions:
   actions: write
@@ -69,13 +72,11 @@ jobs:
           cp /tmp/eng/nnue.bin eng/
           ln -s "$PWD/tb" eng/tb
       - name: Previous theta
-        if: inputs.prev_run != ''
-        uses: actions/download-artifact@v4
-        with:
-          name: spsa-theta
-          run-id: ${{ inputs.prev_run }}
-          github-token: ${{ github.token }}
-          path: prev
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREV: ${{ inputs.prev_run }}
+          THETA: ${{ inputs.theta }}
+        run: sh tools/spsa_prev.sh
       - name: Play
         env:
           TC: ${{ inputs.tc }}
@@ -103,15 +104,14 @@ jobs:
           merge-multiple: true
           path: grads
       - name: Previous theta
-        if: inputs.prev_run != ''
-        uses: actions/download-artifact@v4
-        with:
-          name: spsa-theta
-          run-id: ${{ inputs.prev_run }}
-          github-token: ${{ github.token }}
-          path: prev
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREV: ${{ inputs.prev_run }}
+          THETA: ${{ inputs.theta }}
+        run: sh tools/spsa_prev.sh
       - name: Update
         run: |
+          set -o pipefail
           python3 tools/spsa.py update grads/*.json --spec tools/spsa_params.txt --theta prev/theta.json \
             --r "${{ inputs.r }}" --out theta.json | tee summary.md
           cat summary.md >> "$GITHUB_STEP_SUMMARY"
