@@ -30,7 +30,7 @@ on:
         description: Run id of the previous round (set by the previous round; leave empty)
         default: ""
       theta:
-        description: Starting theta.json contents, used when prev_run is empty (default = the engine's values)
+        description: Starting theta.json contents (JSON or base64), used when prev_run is empty (default = the engine's values)
         default: ""
 
 permissions:

@@ -10,6 +10,11 @@ if [ -n "$PREV" ]; then
   done
   [ -f prev/theta.json ] || { echo "no spsa-theta artifact from run $PREV"; exit 1; }
 elif [ -n "$THETA" ]; then
-  printf '%s' "$THETA" > prev/theta.json
+  # JSON as is, or base64 (survives shells that mangle quotes when passing it to gh)
+  case $THETA in
+    \{*) printf '%s' "$THETA" > prev/theta.json ;;
+    *) printf '%s' "$THETA" | base64 -d > prev/theta.json ;;
+  esac
+  python3 -c "import json; json.load(open('prev/theta.json'))" || { echo "theta input is not valid JSON"; exit 1; }
 fi
 [ -f prev/theta.json ] && cat prev/theta.json || echo "starting from the engine's values"
