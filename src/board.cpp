@@ -230,12 +230,12 @@ void initTables() {
 }
 
 const char* variantName(int v) {
-    static const char* N[] = {"Standard", "Chess960", "Three-check", "Crazyhouse", "King of the Hill", "Horde", "Racing Kings"};
+    static const char* N[] = {"Standard", "Chess960", "Three-check", "Crazyhouse", "King of the Hill", "Horde", "Racing Kings", "Antichess"};
     return v >= 0 && v < NUM_VARIANTS ? N[v] : "?";
 }
 
 const char* variantUciName(int v) {
-    static const char* N[] = {"chess", "chess960", "3check", "crazyhouse", "kingofthehill", "horde", "racingkings"};
+    static const char* N[] = {"chess", "chess960", "3check", "crazyhouse", "kingofthehill", "horde", "racingkings", "antichess"};
     return v >= 0 && v < NUM_VARIANTS ? N[v] : "?";
 }
 
@@ -257,6 +257,7 @@ std::string variantStartFEN(int v) {
         case CRAZYHOUSE: return "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1";
         case HORDE: return "rnbqkbnr/pppppppp/8/1PP2PP1/PPPPPPPP/PPPPPPPP/PPPPPPPP/PPPPPPPP w kq - 0 1";
         case RACING_KINGS: return "8/8/8/8/8/8/krbnNBRK/qrbnNBRQ w - - 0 1";
+        case ANTICHESS: return "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1";
         default: return "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
     }
 }
@@ -363,7 +364,7 @@ void Board::put(int s, int piece) {
     if (piece) {
         addPiece(s, piece);
         pieceCount++;
-        if (typeOf(piece) == KING) kingSq[colorOf(piece)] = s;
+        if (typeOf(piece) == KING && variant != ANTICHESS) kingSq[colorOf(piece)] = s;
     }
 }
 
@@ -467,7 +468,7 @@ bool Board::setFEN(const std::string& fenIn) {
     }
     if (variant != CRAZYHOUSE) std::memset(pocket, 0, sizeof(pocket)), promoted = 0;
     if (variant != THREE_CHECK) checks[0] = checks[1] = 0;
-    if (kings[BLACK] != 1 || kings[WHITE] != (variant == HORDE ? 0 : 1)) return false;
+    if (variant != ANTICHESS && (kings[BLACK] != 1 || kings[WHITE] != (variant == HORDE ? 0 : 1))) return false;
     if (side != "w" && side != "b") return false;
     stm = side == "b" ? BLACK : WHITE;
     checkCache = -1;
@@ -587,6 +588,7 @@ void Board::genMoves(MoveList& ml, bool capturesOnly) const {
     Bitboard push2 = shift(push1 & thirdRank) & empty;
     auto addPromos = [&](int from, int to, uint32_t flags) {
         for (int pr : {QUEEN, KNIGHT, ROOK, BISHOP}) ml.add(encodeMove(from, to, pr, flags));
+        if (variant == ANTICHESS) ml.add(encodeMove(from, to, KING, flags));
     };
     for (Bitboard b = push1 & promoRank; b;) {
         int to = popLsb(b);
@@ -670,6 +672,15 @@ void Board::genMoves(MoveList& ml, bool capturesOnly) const {
             while (to) ml.add(encodeDrop(popLsb(to), t));
         }
     }
+
+    // Antichess: capturing is compulsory, so when any capture exists only the captures are moves.
+    // (There is no check, so every move generated here is legal.)
+    if (variant == ANTICHESS) {
+        int n = 0;
+        for (int i = 0; i < ml.count; i++)
+            if (isCapture(ml.moves[i])) ml.moves[n++] = ml.moves[i];
+        if (n) ml.count = n;
+    }
 }
 
 void Board::genLegal(MoveList& ml) {
@@ -749,7 +760,7 @@ bool Board::makeMove(Move m) {
         dirty(acc, np, to, 1);
         addPiece(to, np);
         hash ^= Z_piece[np][to];
-        if (typeOf(p) == KING) kingSq[stm] = to;
+        if (typeOf(p) == KING && variant != ANTICHESS) kingSq[stm] = to;
         if (variant == CRAZYHOUSE) {
             if (promoted & bit(from))
                 promoted ^= bit(from) | bit(to);
@@ -814,7 +825,7 @@ void Board::unmakeMove() {
         int p = movePromo(m) ? makePiece(stm, PAWN) : sq[to];
         removePiece(to);
         addPiece(from, p);
-        if (typeOf(p) == KING) kingSq[stm] = from;
+        if (typeOf(p) == KING && variant != ANTICHESS) kingSq[stm] = from;
         if (u.captured) {
             int capSq = (flags & MF_EP) ? to + (stm == WHITE ? -8 : 8) : to;
             addPiece(capSq, u.captured);
@@ -862,6 +873,7 @@ int Board::variantOutcome() const {
         case THREE_CHECK: return checks[them] >= 3 ? OUTCOME_LOSS : 0;
         case KING_OF_THE_HILL: return kingSq[them] >= 0 && (bit(kingSq[them]) & CENTER) ? OUTCOME_LOSS : 0;
         case HORDE: return occ[stm] ? 0 : OUTCOME_LOSS;
+        case ANTICHESS: return !occ[stm] ? OUTCOME_WIN : !occ[them] ? OUTCOME_LOSS : 0;  // lose everything to win
         case RACING_KINGS: {
             // First king to the 8th rank wins, except that White moves first: when White gets there, Black
             // has one more move, and reaching the 8th rank with it draws.
@@ -896,6 +908,7 @@ std::string Board::variantOutcomeText() const {
     std::string winner = (stm == WHITE) == (o == OUTCOME_LOSS) ? "Black" : "White";
     switch (variant) {
         case RACING_KINGS: return winner + " wins the race";
+        case ANTICHESS: return winner + " wins - no pieces left";
         case THREE_CHECK: return winner + " wins by three checks";
         case KING_OF_THE_HILL: return winner + " wins - king reached the center";
         default: return "Black wins - the horde is destroyed";

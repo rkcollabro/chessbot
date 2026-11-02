@@ -11,7 +11,7 @@ enum Color : int { WHITE = 0, BLACK = 1 };
 
 // Rule sets. Standard and Chess960 share everything except the start position and castling setup.
 enum Variant : int {
-    STANDARD = 0, CHESS960, THREE_CHECK, CRAZYHOUSE, KING_OF_THE_HILL, HORDE, RACING_KINGS, NUM_VARIANTS
+    STANDARD = 0, CHESS960, THREE_CHECK, CRAZYHOUSE, KING_OF_THE_HILL, HORDE, RACING_KINGS, ANTICHESS, NUM_VARIANTS
 };
 const char* variantName(int v);     // "Three-check"
 const char* variantUciName(int v);  // "3check", as UCI_Variant / lichess name it
@@ -151,7 +151,7 @@ public:
     int halfmove = 0;
     int fullmove = 1;
     uint64_t hash = 0;
-    int kingSq[2] = {-1, -1};  // -1 for White in horde
+    int kingSq[2] = {-1, -1};  // -1 for White in horde, and for both in antichess (any number of ordinary kings)
     int pieceCount = 0;  // all pieces including kings
     mutable int checkCache = -1;  // -1 unknown, else whether the side to move is in check
     std::vector<Undo> undoStack;

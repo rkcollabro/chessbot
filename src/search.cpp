@@ -355,6 +355,32 @@ public:
         std::swap(scores[i], scores[best]);
     }
 
+    // Antichess: captures are compulsory, so while one is available there is no standing pat - every capture
+    // is searched. Without one the position is quiet and the evaluation stands (with no move at all, the side
+    // to move is stalemated, which wins).
+    int qsearchAntichess(int alpha, int beta, int ply) {
+        MoveList ml;
+        b.genMoves(ml);
+        if (!ml.count) return MATE - ply;
+        if (!isCapture(ml.moves[0])) return corrected(eval());
+        int scores[MAX_MOVES];
+        for (int i = 0; i < ml.count; i++) scores[i] = scoreMove(ml.moves[i], NO_MOVE, ply, NO_MOVE);
+        int best = -INF;
+        for (int i = 0; i < ml.count; i++) {
+            pickMove(ml, scores, i);
+            if (!b.makeMove(ml.moves[i])) continue;
+            int s = -qsearch(-beta, -alpha, ply + 1);
+            b.unmakeMove();
+            if (stopped) return 0;
+            if (s > best) {
+                best = s;
+                if (s > alpha) alpha = s;
+                if (s >= beta) break;
+            }
+        }
+        return best;
+    }
+
     int qsearch(int alpha, int beta, int ply) {
         pvLen[ply] = ply;
         if ((++nodes & 1023) == 0) checkTime();
@@ -367,6 +393,7 @@ public:
         }
         if (ply >= MAX_PLY - 1) return eval();
         if (b.variant != STANDARD && hasVariantWinNow(b)) return MATE - ply - 1;
+        if (b.variant == ANTICHESS) return qsearchAntichess(alpha, beta, ply);
 
         TTData tt;
         Move ttMove = NO_MOVE;
@@ -485,7 +512,8 @@ public:
             if (depth <= 6 && std::abs(beta) < MATE_BOUND && staticEval - 85 * (depth - improving) >= beta)
                 return staticEval;
             // Null-move pruning.
-            if (nullOk && depth >= 3 && staticEval >= beta && b.hasNonPawnMaterial(b.stm)) {
+            // (Not in antichess: zugzwang is the whole game there.)
+            if (nullOk && depth >= 3 && staticEval >= beta && b.hasNonPawnMaterial(b.stm) && b.variant != ANTICHESS) {
                 int R = 3 + depth / 4 + std::min(3, (staticEval - beta) / 200);
                 moveStack[ply] = NO_MOVE;
                 b.makeNull();
@@ -524,7 +552,10 @@ public:
                     if (depth <= 6 && staticEval + 100 + 90 * depth <= alpha) continue;
                 }
                 // SEE pruning: skip moves that lose too much material at low depth.
-                if (depth <= 6 && scores[i] < 900000 && see(b, m) < (quiet ? -60 * depth : -90 * depth)) continue;
+                // (Not in antichess, where giving material away is the aim.)
+                if (depth <= 6 && scores[i] < 900000 && b.variant != ANTICHESS &&
+                    see(b, m) < (quiet ? -60 * depth : -90 * depth))
+                    continue;
             }
 
             // Singular extension: if the TT move is much better than every alternative, search it deeper.
@@ -605,6 +636,7 @@ public:
         }
         if (!legal) {
             if (excludedMove) return alpha;
+            if (b.variant == ANTICHESS) return MATE - ply;  // stalemated: the side to move wins
             return inCheck ? -MATE + ply : 0;
         }
 

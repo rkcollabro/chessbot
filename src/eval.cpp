@@ -274,9 +274,32 @@ namespace {
 int fiftyMoveScale(const Board& b, int score) {
     return score * (200 - b.halfmove) / 200;
 }
+// Antichess, from the side to move's view. Giving pieces away is the aim, so having fewer of them is good,
+// and mobility helps: spare quiet moves are tempo, and a side with few moves is easier to force into captures.
+// Deliberately simple: the search, with compulsory captures making play very forcing, does the real work.
+int antichessEval(const Board& b) {
+    const int us = b.stm, them = us ^ 1;
+    int score = 60 * (popcount(b.occ[them]) - popcount(b.occ[us]));
+    for (int c = 0; c < 2; c++) {
+        int mob = 0;
+        for (int t = KNIGHT; t <= KING; t++)
+            for (Bitboard p = b.bb(c, t); p;) {
+                int s = popLsb(p);
+                Bitboard a = t == KNIGHT ? attacks::knight(s) : t == BISHOP ? attacks::bishop(s, b.occAll)
+                           : t == ROOK   ? attacks::rook(s, b.occAll)
+                           : t == QUEEN  ? attacks::queen(s, b.occAll)
+                                         : attacks::king(s);
+                mob += popcount(a & ~b.occAll);
+            }
+        score += (c == us ? 2 : -2) * mob;
+    }
+    return score;
+}
+
 }  // namespace
 
 int evaluate(const Board& b) {
+    if (b.variant == ANTICHESS) return fiftyMoveScale(b, antichessEval(b));
     if ((b.variant == STANDARD || b.variant == CHESS960) && nnue::active())
         return fiftyMoveScale(b, nnue::evaluate(b));
     ScoreAcc acc;

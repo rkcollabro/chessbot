@@ -195,6 +195,8 @@ void updateGameOver() {
     if (!ml.count) {
         if (g.board.inCheck())
             g.gameOver = std::string("Checkmate - ") + (g.board.stm == WHITE ? "Black" : "White") + " wins";
+        else if (g.board.variant == ANTICHESS)
+            g.gameOver = std::string("Stalemate - ") + (g.board.stm == WHITE ? "White" : "Black") + " wins";
         else
             g.gameOver = "Draw by stalemate";
     } else if (g.board.halfmove >= 100) {
