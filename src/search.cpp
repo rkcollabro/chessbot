@@ -348,8 +348,8 @@ public:
     int corrected(int raw) {
         int* e[3];
         corrEntries(e);
-        int c = F_NPCORR ? raw + (2 * *e[0] + *e[1] + *e[2]) / (2 * CORR_GRAIN)  // pawn weighted 1, others 1/2
-                         : raw + *e[0] / CORR_GRAIN;
+        // Every table learns the whole gap, so the weights must add up to 1: pawn 1/2, each non-pawn table 1/4.
+        int c = F_NPCORR ? raw + (2 * *e[0] + *e[1] + *e[2]) / (4 * CORR_GRAIN) : raw + *e[0] / CORR_GRAIN;
         return std::max(-MATE_BOUND + 1, std::min(MATE_BOUND - 1, c));
     }
 
