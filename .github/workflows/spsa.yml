@@ -1,0 +1,131 @@
+# SPSA tuning of the search parameters (tools/spsa.py, tools/spsa_params.txt), in rounds across parallel runners.
+# Every round's shards play from the same theta; the combine job adds up their gradient sums, moves theta, uploads
+# it as the "spsa-theta" artifact (with the full history) and dispatches the next round, up to max_rounds.
+name: SPSA
+run-name: SPSA ${{ inputs.ref }} (round ${{ inputs.round }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Engine git ref to tune (built with -DTUNE)
+        required: true
+        default: master
+      flags:
+        description: Extra compiler flags (e.g. -DSEARCH_FEATURES=0x1AF)
+        default: ""
+      tc:
+        description: Time control, seconds+increment
+        default: "8+0.08"
+      r:
+        description: Learning rate (theta += r * c * sum(result * delta))
+        default: "0.005"
+      max_rounds:
+        description: Stop after this many rounds (1000 game pairs each)
+        default: "15"
+      round:
+        description: Round number (set by the previous round; leave at 1)
+        default: "1"
+      prev_run:
+        description: Run id of the previous round (set by the previous round; leave empty)
+        default: ""
+
+permissions:
+  actions: write
+  contents: read
+
+env:
+  JOBS: 20
+  PAIRS: 50  # per job and round: 20 x 50 = 1000 game pairs a round
+
+jobs:
+  shard:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/cache/restore@v4
+        with:
+          path: tb
+          key: tb-v1
+          fail-on-cache-miss: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install chess==1.11.2
+      - name: Build
+        env:
+          REF: ${{ inputs.ref }}
+          FLAGS: ${{ inputs.flags }}
+        run: |
+          git worktree add /tmp/eng "origin/$REF" 2>/dev/null || git worktree add /tmp/eng "$REF"
+          mkdir -p eng
+          sh tools/ci_build.sh /tmp/eng/src eng/chesscli -DTUNE $FLAGS
+          cp /tmp/eng/nnue.bin eng/
+          ln -s "$PWD/tb" eng/tb
+      - name: Previous theta
+        if: inputs.prev_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: spsa-theta
+          run-id: ${{ inputs.prev_run }}
+          github-token: ${{ github.token }}
+          path: prev
+      - name: Play
+        env:
+          TC: ${{ inputs.tc }}
+          ROUND: ${{ inputs.round }}
+        run: |
+          offset=$(( ((ROUND - 1) * JOBS * PAIRS + ${{ matrix.shard }} * PAIRS) % 3000 ))
+          python3 tools/spsa.py play eng/chesscli --spec tools/spsa_params.txt --theta prev/theta.json \
+            --pairs "$PAIRS" --offset "$offset" --seed "$(( ${{ github.run_id }} % 100000 * 100 + ${{ matrix.shard }} ))" \
+            --tc "$TC" --concurrency 4 --out "grad-${{ matrix.shard }}.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grad-${{ matrix.shard }}
+          path: grad-${{ matrix.shard }}.json
+          retention-days: 30
+
+  combine:
+    needs: shard
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: grad-*
+          merge-multiple: true
+          path: grads
+      - name: Previous theta
+        if: inputs.prev_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: spsa-theta
+          run-id: ${{ inputs.prev_run }}
+          github-token: ${{ github.token }}
+          path: prev
+      - name: Update
+        run: |
+          python3 tools/spsa.py update grads/*.json --spec tools/spsa_params.txt --theta prev/theta.json \
+            --r "${{ inputs.r }}" --out theta.json | tee summary.md
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spsa-theta
+          path: theta.json
+          retention-days: 90
+      - name: Next round
+        if: fromJson(inputs.round) < fromJson(inputs.max_rounds)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run spsa.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+            -f ref="${{ inputs.ref }}" -f flags="${{ inputs.flags }}" -f tc="${{ inputs.tc }}" -f r="${{ inputs.r }}" \
+            -f max_rounds="${{ inputs.max_rounds }}" -f round="$(( ${{ inputs.round }} + 1 ))" -f prev_run="${{ github.run_id }}"
+          echo "Round $(( ${{ inputs.round }} + 1 )) dispatched." >> "$GITHUB_STEP_SUMMARY"
