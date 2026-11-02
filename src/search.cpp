@@ -114,12 +114,56 @@ constexpr int SF = SEARCH_FEATURES;
 constexpr bool F_CONT = SF & 1, F_CAP = SF & 2, F_NPCORR = SF & 4, F_RAZOR = SF & 8, F_PROBCUT = SF & 16,
                F_QSFUT = SF & 32, F_HISTPRUNE = SF & 64, F_EXT = SF & 128, F_TTCAP = SF & 256;
 
+// Search parameters, overridable at build time (-DNAME=value) so each setting can be tested against master.
+// The defaults reproduce master exactly; razoring, ProbCut and history pruning only apply when enabled in
+// SEARCH_FEATURES.
+#ifndef RAZOR_DEPTH
+#define RAZOR_DEPTH 3
+#endif
+#ifndef RAZOR_A
+#define RAZOR_A 300  // razor margin: A + B * depth^2
+#endif
+#ifndef RAZOR_B
+#define RAZOR_B 200
+#endif
+#ifndef PC_MARGIN
+#define PC_MARGIN 200
+#endif
+#ifndef PC_DEPTH
+#define PC_DEPTH 5
+#endif
+#ifndef HP_DEPTH
+#define HP_DEPTH 4
+#endif
+#ifndef HP_MULT
+#define HP_MULT 2000
+#endif
+#ifndef RFP_MARGIN
+#define RFP_MARGIN 85
+#endif
+#ifndef FUT_BASE
+#define FUT_BASE 100
+#endif
+#ifndef FUT_MULT
+#define FUT_MULT 90
+#endif
+#ifndef LMR_BASE
+#define LMR_BASE 75  // hundredths
+#endif
+#ifndef LMR_DIV
+#define LMR_DIV 225  // hundredths
+#endif
+#ifndef NODE_TM
+#define NODE_TM 0  // 1: also scale the time target by the share of nodes spent on the best root move
+#endif
+
 // Late move reduction amounts by [depth][move number].
 int LMR[64][64];
 struct LmrInit {
     LmrInit() {
         for (int d = 1; d < 64; d++)
-            for (int m = 1; m < 64; m++) LMR[d][m] = int(0.75 + std::log(d) * std::log(m) / 2.25);
+            for (int m = 1; m < 64; m++)
+                LMR[d][m] = int(LMR_BASE / 100.0 + std::log(d) * std::log(m) / (LMR_DIV / 100.0));
     }
 } g_lmrInit;
 
@@ -265,6 +309,7 @@ public:
     int pawnCorr[2][CORR_SIZE];  // [side to move][pawn key]
     int nonPawnCorr[2][2][CORR_SIZE];  // [side to move][piece color][that color's non-pawn piece key]
     int doubleExt[MAX_PLY];  // double extensions taken on the path to this ply
+    uint64_t rootNodes[64][64];  // nodes spent below each root move this search, by from/to (NODE_TM)
 
     Move pv[MAX_PLY][MAX_PLY];
     int pvLen[MAX_PLY];
@@ -594,10 +639,11 @@ public:
 
         if (!pvNode && !inCheck && !excludedMove) {
             // Reverse futility pruning: far above beta at low depth.
-            if (depth <= 6 && std::abs(beta) < MATE_BOUND && staticEval - 85 * (depth - improving) >= beta)
+            if (depth <= 6 && std::abs(beta) < MATE_BOUND && staticEval - RFP_MARGIN * (depth - improving) >= beta)
                 return staticEval;
             // Razoring: far below alpha at low depth, check that captures cannot save it.
-            if (F_RAZOR && plainChess && depth <= 3 && std::abs(alpha) < MATE_BOUND && staticEval + 250 * depth <= alpha) {
+            if (F_RAZOR && plainChess && depth <= RAZOR_DEPTH && std::abs(alpha) < MATE_BOUND &&
+                staticEval + RAZOR_A + RAZOR_B * depth * depth <= alpha) {
                 int s = qsearch(alpha, alpha + 1, ply);
                 if (stopped) return 0;
                 if (s <= alpha) return s;
@@ -615,8 +661,8 @@ public:
                 if (s >= beta) return s >= MATE_BOUND ? beta : s;
             }
             // ProbCut: a capture that beats beta by a margin in a reduced search almost surely beats beta.
-            const int pcBeta = beta + 200;
-            if (F_PROBCUT && plainChess && depth >= 5 && std::abs(beta) < MATE_BOUND &&
+            const int pcBeta = beta + PC_MARGIN;
+            if (F_PROBCUT && plainChess && depth >= PC_DEPTH && std::abs(beta) < MATE_BOUND &&
                 !(ttHit && tt.depth >= depth - 3 && ttScore < pcBeta)) {
                 MoveList pml;
                 b.genMoves(pml, true);
@@ -668,9 +714,9 @@ public:
                     int lmpLimit = (3 + depth * depth) / (improving ? 1 : 2);
                     if (depth <= 7 && nQuiets >= lmpLimit) continue;
                     // Futility pruning: a quiet move cannot lift a hopeless eval to alpha.
-                    if (depth <= 6 && staticEval + 100 + 90 * depth <= alpha) continue;
+                    if (depth <= 6 && staticEval + FUT_BASE + FUT_MULT * depth <= alpha) continue;
                     // History pruning: quiet moves that keep failing here, at low depth.
-                    if (F_HISTPRUNE && depth <= 4 && scores[i] < 880000 && stat < -2000 * depth) continue;
+                    if (F_HISTPRUNE && depth <= HP_DEPTH && scores[i] < 880000 && stat < -HP_MULT * depth) continue;
                 }
                 // SEE pruning: skip moves that lose too much material at low depth.
                 if (depth <= 6 && scores[i] < 900000 && exchangeRules(b) &&
@@ -706,6 +752,7 @@ public:
             const bool givesCheck = b.inCheck();
             const int newDepth = depth - 1 + ext;
 
+            const uint64_t nodesBefore = nodes;
             int s;
             if (legal == 1) {
                 s = -negamax(newDepth, -beta, -alpha, ply + 1, true);
@@ -726,6 +773,7 @@ public:
                 if (s > alpha && s < beta) s = -negamax(newDepth, -beta, -alpha, ply + 1, true);
             }
             b.unmakeMove();
+            if (NODE_TM && root) rootNodes[moveFrom(m)][moveTo(m)] += nodes - nodesBefore;
             if (stopped) return 0;
 
             if (s > best) {
@@ -912,6 +960,8 @@ public:
         int score = 0, prevScore = 0, stableIters = 0;
         double instability = 0;
         Move prevBest = NO_MOVE;
+        if (NODE_TM) std::memset(rootNodes, 0, sizeof(rootNodes));
+        const uint64_t nodesAtStart = nodes;
         if (softMs) limitMs = std::min(hardMs, softMs * 2);
         for (int depth = 1; depth < MAX_PLY - 8; depth++) {
             bool done = searchDepth(depth, score);
@@ -941,6 +991,11 @@ public:
                 double scale = 1.0 + 1.5 * instability;
                 if (depth >= 5) scale *= 1.0 + std::clamp((prevScore - score) / 100.0, 0.0, 1.0);
                 if (stableIters >= 6) scale *= 0.7;
+                // Most of the effort going into the best move means the alternatives were refuted quickly.
+                if (NODE_TM && depth >= 6 && nodes > nodesAtStart) {
+                    double f = double(rootNodes[moveFrom(best)][moveTo(best)]) / double(nodes - nodesAtStart);
+                    scale *= std::clamp((1.5 - f) * 1.3, 0.5, 1.6);
+                }
                 double target = softMs * scale;
                 limitMs = std::min(hardMs, int(target * 2));
                 prevBest = best;
