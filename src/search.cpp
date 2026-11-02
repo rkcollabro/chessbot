@@ -114,13 +114,117 @@ constexpr int SF = SEARCH_FEATURES;
 constexpr bool F_CONT = SF & 1, F_CAP = SF & 2, F_NPCORR = SF & 4, F_RAZOR = SF & 8, F_PROBCUT = SF & 16,
                F_QSFUT = SF & 32, F_HISTPRUNE = SF & 64, F_EXT = SF & 128, F_TTCAP = SF & 256;
 
+// Search parameters, overridable at build time (-DNAME=value) so each setting can be tested against master.
+// The defaults reproduce master exactly; razoring, ProbCut and history pruning only apply when enabled in
+// SEARCH_FEATURES.
+#ifndef RAZOR_DEPTH
+#define RAZOR_DEPTH 3
+#endif
+#ifndef RAZOR_A
+#define RAZOR_A 300  // razor margin: A + B * depth^2
+#endif
+#ifndef RAZOR_B
+#define RAZOR_B 200
+#endif
+#ifndef PC_MARGIN
+#define PC_MARGIN 200
+#endif
+#ifndef PC_DEPTH
+#define PC_DEPTH 5
+#endif
+#ifndef HP_DEPTH
+#define HP_DEPTH 4
+#endif
+#ifndef HP_MULT
+#define HP_MULT 2000
+#endif
+#ifndef RFP_MARGIN
+#define RFP_MARGIN 85
+#endif
+#ifndef FUT_BASE
+#define FUT_BASE 100
+#endif
+#ifndef FUT_MULT
+#define FUT_MULT 90
+#endif
+#ifndef LMR_BASE
+#define LMR_BASE 75  // hundredths
+#endif
+#ifndef LMR_DIV
+#define LMR_DIV 225  // hundredths
+#endif
+#ifndef NODE_TM
+#define NODE_TM 0  // 1: also scale the time target by the share of nodes spent on the best root move
+#endif
+#ifndef NMP_EVAL
+#define NMP_EVAL 200  // null-move reduction grows by one per this much eval above beta (up to 3)
+#endif
+#ifndef SEE_QUIET
+#define SEE_QUIET 60  // SEE pruning thresholds per depth
+#endif
+#ifndef SEE_CAP
+#define SEE_CAP 90
+#endif
+#ifndef DEXT_MARGIN
+#define DEXT_MARGIN 25  // singular-search margin below which the TT move gets a double extension
+#endif
+#ifndef LMR_HIST
+#define LMR_HIST 12000  // history per ply of LMR adjustment
+#endif
+#ifndef HIST_MULT
+#define HIST_MULT 16  // history bonus: min(HIST_MULT * depth^2, HIST_MAX)
+#endif
+#ifndef HIST_MAX
+#define HIST_MAX 1600
+#endif
+#ifndef ASP_DELTA
+#define ASP_DELTA 25  // initial aspiration window half-width
+#endif
+#ifndef QS_FUT
+#define QS_FUT 150  // qsearch futility margin
+#endif
+
+// With -DTUNE the parameters become UCI options (for SPSA); otherwise they are compile-time constants.
+#ifdef TUNE
+std::vector<TuneParam>& tuneRegistry() {
+    static std::vector<TuneParam> v;
+    return v;
+}
+struct TuneReg {
+    TuneReg(const char* n, int* p, int lo, int hi) { tuneRegistry().push_back({n, p, lo, hi}); }
+};
+#define TP(n, lo, hi) int P_##n = n; TuneReg reg_##n(#n, &P_##n, lo, hi);
+#else
+#define TP(n, lo, hi) constexpr int P_##n = n;
+#endif
+TP(RAZOR_A, 0, 1000)
+TP(RAZOR_B, 50, 600)
+TP(PC_MARGIN, 80, 400)
+TP(HP_MULT, 500, 8000)
+TP(RFP_MARGIN, 40, 150)
+TP(FUT_BASE, 0, 250)
+TP(FUT_MULT, 40, 160)
+TP(LMR_BASE, 0, 150)
+TP(LMR_DIV, 150, 350)
+TP(NMP_EVAL, 100, 400)
+TP(SEE_QUIET, 20, 120)
+TP(SEE_CAP, 40, 160)
+TP(DEXT_MARGIN, 0, 80)
+TP(LMR_HIST, 4000, 24000)
+TP(HIST_MULT, 4, 32)
+TP(HIST_MAX, 600, 3200)
+TP(ASP_DELTA, 10, 60)
+TP(QS_FUT, 50, 300)
+
 // Late move reduction amounts by [depth][move number].
 int LMR[64][64];
+void initLMR() {
+    for (int d = 1; d < 64; d++)
+        for (int m = 1; m < 64; m++)
+            LMR[d][m] = int(P_LMR_BASE / 100.0 + std::log(d) * std::log(m) / (P_LMR_DIV / 100.0));
+}
 struct LmrInit {
-    LmrInit() {
-        for (int d = 1; d < 64; d++)
-            for (int m = 1; m < 64; m++) LMR[d][m] = int(0.75 + std::log(d) * std::log(m) / 2.25);
-    }
+    LmrInit() { initLMR(); }
 } g_lmrInit;
 
 // Static exchange evaluation: material outcome of the capture sequence on the target square,
@@ -265,6 +369,7 @@ public:
     int pawnCorr[2][CORR_SIZE];  // [side to move][pawn key]
     int nonPawnCorr[2][2][CORR_SIZE];  // [side to move][piece color][that color's non-pawn piece key]
     int doubleExt[MAX_PLY];  // double extensions taken on the path to this ply
+    uint64_t rootNodes[64][64];  // nodes spent below each root move this search, by from/to (NODE_TM)
 
     Move pv[MAX_PLY][MAX_PLY];
     int pvLen[MAX_PLY];
@@ -511,7 +616,7 @@ public:
                 int victim = (moveFlags(m) & MF_EP) ? PAWN : typeOf(b.sq[moveTo(m)]);
                 if (!movePromo(m) && best + PIECE_VALUE[victim] + 200 < alpha && exchangeRules(b)) continue;
                 // Futility: well short of alpha, only captures that win material can help.
-                if (F_QSFUT && !movePromo(m) && best + 150 <= alpha && exchangeRules(b) && see(b, m) <= 0) continue;
+                if (F_QSFUT && !movePromo(m) && best + P_QS_FUT <= alpha && exchangeRules(b) && see(b, m) <= 0) continue;
             }
             if (!b.makeMove(m)) continue;
             ttPrefetch(b.hash);
@@ -594,10 +699,11 @@ public:
 
         if (!pvNode && !inCheck && !excludedMove) {
             // Reverse futility pruning: far above beta at low depth.
-            if (depth <= 6 && std::abs(beta) < MATE_BOUND && staticEval - 85 * (depth - improving) >= beta)
+            if (depth <= 6 && std::abs(beta) < MATE_BOUND && staticEval - P_RFP_MARGIN * (depth - improving) >= beta)
                 return staticEval;
             // Razoring: far below alpha at low depth, check that captures cannot save it.
-            if (F_RAZOR && plainChess && depth <= 3 && std::abs(alpha) < MATE_BOUND && staticEval + 250 * depth <= alpha) {
+            if (F_RAZOR && plainChess && depth <= RAZOR_DEPTH && std::abs(alpha) < MATE_BOUND &&
+                staticEval + P_RAZOR_A + P_RAZOR_B * depth * depth <= alpha) {
                 int s = qsearch(alpha, alpha + 1, ply);
                 if (stopped) return 0;
                 if (s <= alpha) return s;
@@ -605,7 +711,7 @@ public:
             // Null-move pruning.
             // (Not in antichess: zugzwang is the whole game there.)
             if (nullOk && depth >= 3 && staticEval >= beta && b.hasNonPawnMaterial(b.stm) && b.variant != ANTICHESS) {
-                int R = 3 + depth / 4 + std::min(3, (staticEval - beta) / 200);
+                int R = 3 + depth / 4 + std::min(3, (staticEval - beta) / P_NMP_EVAL);
                 moveStack[ply] = NO_MOVE;
                 b.makeNull();
                 ttPrefetch(b.hash);
@@ -615,8 +721,8 @@ public:
                 if (s >= beta) return s >= MATE_BOUND ? beta : s;
             }
             // ProbCut: a capture that beats beta by a margin in a reduced search almost surely beats beta.
-            const int pcBeta = beta + 200;
-            if (F_PROBCUT && plainChess && depth >= 5 && std::abs(beta) < MATE_BOUND &&
+            const int pcBeta = beta + P_PC_MARGIN;
+            if (F_PROBCUT && plainChess && depth >= PC_DEPTH && std::abs(beta) < MATE_BOUND &&
                 !(ttHit && tt.depth >= depth - 3 && ttScore < pcBeta)) {
                 MoveList pml;
                 b.genMoves(pml, true);
@@ -668,13 +774,13 @@ public:
                     int lmpLimit = (3 + depth * depth) / (improving ? 1 : 2);
                     if (depth <= 7 && nQuiets >= lmpLimit) continue;
                     // Futility pruning: a quiet move cannot lift a hopeless eval to alpha.
-                    if (depth <= 6 && staticEval + 100 + 90 * depth <= alpha) continue;
+                    if (depth <= 6 && staticEval + P_FUT_BASE + P_FUT_MULT * depth <= alpha) continue;
                     // History pruning: quiet moves that keep failing here, at low depth.
-                    if (F_HISTPRUNE && depth <= 4 && scores[i] < 880000 && stat < -2000 * depth) continue;
+                    if (F_HISTPRUNE && depth <= HP_DEPTH && scores[i] < 880000 && stat < -P_HP_MULT * depth) continue;
                 }
                 // SEE pruning: skip moves that lose too much material at low depth.
                 if (depth <= 6 && scores[i] < 900000 && exchangeRules(b) &&
-                    see(b, m) < (quiet ? -60 * depth : -90 * depth))
+                    see(b, m) < (quiet ? -P_SEE_QUIET * depth : -P_SEE_CAP * depth))
                     continue;
             }
 
@@ -688,7 +794,7 @@ public:
                 excluded[ply] = NO_MOVE;
                 if (stopped) return 0;
                 if (s < sBeta)
-                    ext = (F_EXT && !pvNode && s < sBeta - 25 && doubleExt[ply] < 6) ? 2 : 1;  // clearly singular: twice
+                    ext = (F_EXT && !pvNode && s < sBeta - P_DEXT_MARGIN && doubleExt[ply] < 6) ? 2 : 1;  // clearly singular: twice
                 else if (sBeta >= beta)
                     return sBeta;  // multi-cut: several moves beat beta
                 else if (F_EXT && ttScore >= beta)
@@ -706,6 +812,7 @@ public:
             const bool givesCheck = b.inCheck();
             const int newDepth = depth - 1 + ext;
 
+            const uint64_t nodesBefore = nodes;
             int s;
             if (legal == 1) {
                 s = -negamax(newDepth, -beta, -alpha, ply + 1, true);
@@ -718,7 +825,7 @@ public:
                     if (m == killers[ply][0] || m == killers[ply][1] || m == counter) r--;
                     if (givesCheck || inCheck) r--;
                     if (F_TTCAP && ttCapture) r++;
-                    r -= stat / (F_CONT ? 12000 : 8000);  // without continuation tables: butterfly history as before
+                    r -= stat / (F_CONT ? P_LMR_HIST : 8000);  // without continuation tables: butterfly history as before
                     r = std::max(0, std::min(r, newDepth - 1));
                 }
                 s = -negamax(newDepth - r, -alpha - 1, -alpha, ply + 1, true);
@@ -726,6 +833,7 @@ public:
                 if (s > alpha && s < beta) s = -negamax(newDepth, -beta, -alpha, ply + 1, true);
             }
             b.unmakeMove();
+            if (NODE_TM && root) rootNodes[moveFrom(m)][moveTo(m)] += nodes - nodesBefore;
             if (stopped) return 0;
 
             if (s > best) {
@@ -741,7 +849,7 @@ public:
                         rootScore = s;
                     }
                     if (s >= beta) {
-                        const int bonus = std::min(16 * depth * depth, 1600);
+                        const int bonus = std::min(P_HIST_MULT * depth * depth, P_HIST_MAX);
                         if (quiet) {
                             if (killers[ply][0] != m) {
                                 killers[ply][1] = killers[ply][0];
@@ -853,7 +961,7 @@ public:
     // One aspiration-window iteration. Returns false if the search was stopped.
     bool searchDepth(int depth, int& score) {
         iterDepth = depth;
-        int delta = 25;
+        int delta = P_ASP_DELTA;
         int alpha = -INF, beta = INF;
         if (depth >= 5) {
             alpha = std::max(score - delta, -INF);
@@ -912,6 +1020,8 @@ public:
         int score = 0, prevScore = 0, stableIters = 0;
         double instability = 0;
         Move prevBest = NO_MOVE;
+        if (NODE_TM) std::memset(rootNodes, 0, sizeof(rootNodes));
+        const uint64_t nodesAtStart = nodes;
         if (softMs) limitMs = std::min(hardMs, softMs * 2);
         for (int depth = 1; depth < MAX_PLY - 8; depth++) {
             bool done = searchDepth(depth, score);
@@ -941,6 +1051,11 @@ public:
                 double scale = 1.0 + 1.5 * instability;
                 if (depth >= 5) scale *= 1.0 + std::clamp((prevScore - score) / 100.0, 0.0, 1.0);
                 if (stableIters >= 6) scale *= 0.7;
+                // Most of the effort going into the best move means the alternatives were refuted quickly.
+                if (NODE_TM && depth >= 6 && nodes > nodesAtStart) {
+                    double f = double(rootNodes[moveFrom(best)][moveTo(best)]) / double(nodes - nodesAtStart);
+                    scale *= std::clamp((1.5 - f) * 1.3, 0.5, 1.6);
+                }
                 double target = softMs * scale;
                 limitMs = std::min(hardMs, int(target * 2));
                 prevBest = best;
@@ -980,6 +1095,16 @@ namespace {
 std::vector<std::unique_ptr<Searcher>> g_pool;
 
 }  // namespace
+
+std::vector<TuneParam>& tuneParams() {
+#ifdef TUNE
+    return tuneRegistry();
+#else
+    static std::vector<TuneParam> none;
+    return none;
+#endif
+}
+void tuneChanged() { initLMR(); }
 
 Move findBestMove(const Board& root, int timeMs, std::atomic<bool>* stop, const InfoFn& info, bool useBook,
                   int threads, int maxNodes, int evalNoise, int softMs, std::atomic<bool>* ponder,

@@ -78,12 +78,20 @@ void uciLoop(const std::string& tbDir, const std::string& bookPath) {
             std::printf("option name UCI_Variant type combo default chess");
             for (int v = 0; v < NUM_VARIANTS; v++) std::printf(" var %s", variantUciName(v));
             std::printf("\n");
+            for (const TuneParam& tp : tuneParams())
+                std::printf("option name %s type spin default %d min %d max %d\n", tp.name, *tp.value, tp.lo, tp.hi);
             std::printf("uciok\n");
         } else if (cmd == "setoption") {
             std::string tok, name, value;
             in >> tok >> name;  // "name" <name>
             while (in >> tok && tok != "value") name += " " + tok;
             in >> value;
+            for (const TuneParam& tp : tuneParams())
+                if (name == tp.name) {
+                    join();
+                    *tp.value = std::max(tp.lo, std::min(tp.hi, std::atoi(value.c_str())));
+                    tuneChanged();
+                }
             if (name == "OwnBook") ownBook = value == "true";
             if (name == "UseNNUE") nnue::setEnabled(value == "true");
             if (name == "Threads") threads = std::max(1, std::atoi(value.c_str()));

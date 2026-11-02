@@ -1,0 +1,16 @@
+# Parameters tuned by tools/spsa.py: NAME C (perturbation size, about 1/20 of the useful range).
+# Bounds and starting values come from the -DTUNE engine's UCI options.
+RFP_MARGIN   8
+FUT_BASE     15
+FUT_MULT     8
+LMR_BASE     10
+LMR_DIV      15
+NMP_EVAL     20
+SEE_QUIET    6
+SEE_CAP      8
+DEXT_MARGIN  6
+LMR_HIST     1200
+HIST_MULT    2
+HIST_MAX     150
+ASP_DELTA    4
+QS_FUT       15

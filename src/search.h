@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include "board.h"
 
@@ -52,3 +53,11 @@ bool hashOnLargePages();  // whether the transposition table got large pages
 void setHashSize(int mb);  // resize (and clear) the transposition table; rounds down to a power of two
 size_t hashSizeMB();
 std::string scoreToString(int score);  // "+0.35", "M4", "-M2"
+// Search parameters exposed as UCI options in -DTUNE builds (empty otherwise); call tuneChanged() after setting.
+struct TuneParam {
+    const char* name;
+    int* value;
+    int lo, hi;
+};
+std::vector<TuneParam>& tuneParams();
+void tuneChanged();
