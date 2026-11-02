@@ -243,6 +243,18 @@ int variantTerms(const Board& b) {
                 // without this the 36 pawns look about 7 pawns worse than Black's army at the start.
                 if (c == WHITE) score += 20 * popcount(b.bb(WHITE, PAWN));
                 break;
+            case ATOMIC: {
+                // A capture next to a king blows it up, so pieces beside our king that the opponent can take
+                // are deadly - unless the kings touch (that capture would destroy the capturer's own king too).
+                const int ek = b.kingSq[e];
+                if (k >= 0 && !(ek >= 0 && (attacks::king(k) & bit(ek)))) {
+                    int danger = 0;
+                    for (Bitboard n = attacks::king(k) & b.occAll; n;)
+                        if (b.attacked(popLsb(n), e)) danger++;
+                    score -= sign * 90 * danger;
+                }
+                break;
+            }
             case RACING_KINGS: {
                 // Both kings race up the board, so progress counts by rank for both colors. Squares on the
                 // rank ahead that the opponent controls slow the king down; if all of them are covered it is stuck.

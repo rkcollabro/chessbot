@@ -11,7 +11,7 @@ enum Color : int { WHITE = 0, BLACK = 1 };
 
 // Rule sets. Standard and Chess960 share everything except the start position and castling setup.
 enum Variant : int {
-    STANDARD = 0, CHESS960, THREE_CHECK, CRAZYHOUSE, KING_OF_THE_HILL, HORDE, RACING_KINGS, ANTICHESS, NUM_VARIANTS
+    STANDARD = 0, CHESS960, THREE_CHECK, CRAZYHOUSE, KING_OF_THE_HILL, HORDE, RACING_KINGS, ANTICHESS, ATOMIC, NUM_VARIANTS
 };
 const char* variantName(int v);     // "Three-check"
 const char* variantUciName(int v);  // "3check", as UCI_Variant / lichess name it
@@ -157,6 +157,12 @@ public:
     std::vector<Undo> undoStack;
     std::vector<uint64_t> hashHistory;  // hash before each move made
     mutable std::vector<NnueAccum> nnueStack;  // indexed by undoStack.size()
+    // Atomic: what each capture blew up (the capturing piece and the non-pawns around it), for unmakeMove.
+    struct Blast {
+        int n = 0;
+        int8_t sq[9], piece[9];
+    };
+    std::vector<Blast> blastStack;
 
     Board();
     void clear();
@@ -170,8 +176,13 @@ public:
     Bitboard attackersTo(int s, Bitboard occupancy) const;  // both colors
     bool attacked(int s, int byColor) const;
     bool inCheck() const {
-        if (checkCache < 0) checkCache = kingSq[stm] >= 0 && attacked(kingSq[stm], stm ^ 1) ? 1 : 0;
+        if (checkCache < 0)
+            checkCache = kingSq[stm] >= 0 && attacked(kingSq[stm], stm ^ 1) && !kingsTouch() ? 1 : 0;
         return checkCache != 0;
+    }
+    // Atomic: kings standing next to each other cannot be checked (capturing one would blow up the other).
+    bool kingsTouch() const {
+        return variant == ATOMIC && kingSq[stm ^ 1] >= 0 && (attacks::king(kingSq[stm]) & bit(kingSq[stm ^ 1]));
     }
 
     // Pseudo-legal moves. capturesOnly also includes promotions.
@@ -206,6 +217,7 @@ private:
     void removePiece(int s);
     void changePocket(int c, int t, int delta);
     void castleSquares(Move m, int& kingTo, int& rookFrom, int& rookTo) const;
+    void explode(int at, NnueAccum& acc, uint8_t& castleKeep);
     NnueAccum& pushAccum();
     static void dirty(NnueAccum& a, int piece, int s, int sign) {
         if (a.ndirty == 4) {

@@ -1,7 +1,7 @@
 // Command-line harness for testing the engine without the GUI.
 //   chesscli test                 perft suite + hash consistency check
 //   chesscli perft <depth> [fen]
-//   (perft and search take --variant <chess960|3check|crazyhouse|kingofthehill|horde|racingkings|antichess> before the fen)
+//   (perft and search take --variant <chess960|3check|crazyhouse|kingofthehill|horde|racingkings|antichess|atomic> before the fen)
 //   chesscli tbgen                build/load all tablebases and print stats
 //   chesscli tbprobe <fen>
 //   chesscli search <ms> [fen]
@@ -156,6 +156,7 @@ int main(int argc, char** argv) {
             {"rnbqkbnr/pppppppp/8/1PP2PP1/PPPPPPPP/PPPPPPPP/PPPPPPPP/PPPPPPPP w kq - 0 1", 4, 23310, HORDE},
             {"8/8/8/8/8/8/krbnNBRK/qrbnNBRQ w - - 0 1", 4, 296242, RACING_KINGS},
             {"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1", 4, 153299, ANTICHESS},
+            {"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 4, 197326, ATOMIC},
         };
         g_checkHash = true;
         bool allOk = true;

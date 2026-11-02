@@ -161,6 +161,10 @@ int see(const Board& b, Move m) {
     return gain[0];
 }
 
+// Static exchange evaluation assumes ordinary captures that trade material: not antichess (where losing
+// material is the aim) or atomic (where a capture blows up everything around it).
+inline bool exchangeRules(const Board& b) { return b.variant != ANTICHESS && b.variant != ATOMIC; }
+
 // Endgame tables and the opening book only know the standard rules.
 inline bool tablebaseRules(const Board& b) { return b.variant == STANDARD || b.variant == CHESS960; }
 
@@ -335,7 +339,7 @@ public:
             int attacker = typeOf(b.sq[moveFrom(m)]);
             int mvvLva = PIECE_VALUE[victim] * 10 - PIECE_VALUE[attacker] / 100 + (promo == QUEEN ? 9000 : 0);
             // Captures that lose material in the exchange go after the quiet moves.
-            if (attacker != PAWN && PIECE_VALUE[victim] < PIECE_VALUE[attacker] && see(b, m) < 0)
+            if (attacker != PAWN && PIECE_VALUE[victim] < PIECE_VALUE[attacker] && exchangeRules(b) && see(b, m) < 0)
                 return -200000 + mvvLva;
             return 1000000 + mvvLva;
         }
@@ -432,7 +436,7 @@ public:
                 if (scores[i] < 0) break;
                 // Delta pruning: even winning this piece cannot lift the score to alpha.
                 int victim = (moveFlags(m) & MF_EP) ? PAWN : typeOf(b.sq[moveTo(m)]);
-                if (!movePromo(m) && best + PIECE_VALUE[victim] + 200 < alpha) continue;
+                if (!movePromo(m) && best + PIECE_VALUE[victim] + 200 < alpha && exchangeRules(b)) continue;
             }
             if (!b.makeMove(m)) continue;
             ttPrefetch(b.hash);
@@ -552,8 +556,7 @@ public:
                     if (depth <= 6 && staticEval + 100 + 90 * depth <= alpha) continue;
                 }
                 // SEE pruning: skip moves that lose too much material at low depth.
-                // (Not in antichess, where giving material away is the aim.)
-                if (depth <= 6 && scores[i] < 900000 && b.variant != ANTICHESS &&
+                if (depth <= 6 && scores[i] < 900000 && exchangeRules(b) &&
                     see(b, m) < (quiet ? -60 * depth : -90 * depth))
                     continue;
             }

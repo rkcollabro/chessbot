@@ -230,12 +230,12 @@ void initTables() {
 }
 
 const char* variantName(int v) {
-    static const char* N[] = {"Standard", "Chess960", "Three-check", "Crazyhouse", "King of the Hill", "Horde", "Racing Kings", "Antichess"};
+    static const char* N[] = {"Standard", "Chess960", "Three-check", "Crazyhouse", "King of the Hill", "Horde", "Racing Kings", "Antichess", "Atomic"};
     return v >= 0 && v < NUM_VARIANTS ? N[v] : "?";
 }
 
 const char* variantUciName(int v) {
-    static const char* N[] = {"chess", "chess960", "3check", "crazyhouse", "kingofthehill", "horde", "racingkings", "antichess"};
+    static const char* N[] = {"chess", "chess960", "3check", "crazyhouse", "kingofthehill", "horde", "racingkings", "antichess", "atomic"};
     return v >= 0 && v < NUM_VARIANTS ? N[v] : "?";
 }
 
@@ -468,7 +468,10 @@ bool Board::setFEN(const std::string& fenIn) {
     }
     if (variant != CRAZYHOUSE) std::memset(pocket, 0, sizeof(pocket)), promoted = 0;
     if (variant != THREE_CHECK) checks[0] = checks[1] = 0;
-    if (variant != ANTICHESS && (kings[BLACK] != 1 || kings[WHITE] != (variant == HORDE ? 0 : 1))) return false;
+    // Antichess: any number of kings. Atomic: a king may already have exploded (the game is then over).
+    if (variant == ATOMIC ? (kings[WHITE] > 1 || kings[BLACK] > 1)
+                          : variant != ANTICHESS && (kings[BLACK] != 1 || kings[WHITE] != (variant == HORDE ? 0 : 1)))
+        return false;
     if (side != "w" && side != "b") return false;
     stm = side == "b" ? BLACK : WHITE;
     checkCache = -1;
@@ -504,7 +507,10 @@ bool Board::setFEN(const std::string& fenIn) {
     halfmove = std::max(0, hm);
     fullmove = fm < 1 ? 1 : fm;
     // The side not to move must not be in check.
-    if (kingSq[stm ^ 1] >= 0 && attacked(kingSq[stm ^ 1], stm)) return false;
+    // (Atomic: not when the kings touch, since then neither can be in check.)
+    if (kingSq[stm ^ 1] >= 0 && attacked(kingSq[stm ^ 1], stm) &&
+        !(variant == ATOMIC && kingSq[stm] >= 0 && (KING_ATT[kingSq[stm]] & bit(kingSq[stm ^ 1]))))
+        return false;
     hash = computeHash();
     return true;
 }
@@ -658,7 +664,9 @@ void Board::genMoves(MoveList& ml, bool capturesOnly) const {
             const int rf = castleRook[right], kt = base + (kingSide ? 6 : 2), rt = base + (kingSide ? 5 : 3);
             if ((rankSpan(k, kt) | rankSpan(rf, rt)) & occAll & ~bit(k) & ~bit(rf)) continue;
             bool safe = true;
-            for (Bitboard path = rankSpan(k, kt); path && safe;)
+            // Atomic: squares next to the enemy king are safe (capturing there would blow up its own king).
+            const Bitboard exempt = variant == ATOMIC && kingSq[them] >= 0 ? KING_ATT[kingSq[them]] : 0;
+            for (Bitboard path = rankSpan(k, kt) & ~exempt; path && safe;)
                 if (attacked(popLsb(path), them)) safe = false;
             if (safe) ml.add(encodeMove(k, rf, 0, MF_CASTLE));
         }
@@ -768,8 +776,10 @@ bool Board::makeMove(Move m) {
                 promoted |= bit(to);
         }
     }
+    uint8_t blastKeep = 0xFF;
+    if (variant == ATOMIC && cap) explode(to, acc, blastKeep);
     hash ^= Z_castle[castle];
-    castle &= castleMask[from] & castleMask[to];
+    castle &= castleMask[from] & castleMask[to] & blastKeep;
     hash ^= Z_castle[castle];
     ep = -1;
     if (flags & MF_DOUBLE) {
@@ -782,6 +792,16 @@ bool Board::makeMove(Move m) {
     hash ^= Z_side;
     checkCache = -1;
 
+    if (variant == ATOMIC) {
+        // Illegal if our own king blew up, or is left in check (impossible while the kings touch).
+        // Blowing up the enemy king wins on the spot, whatever else is attacked.
+        const int us = stm ^ 1, ok = kingSq[us], ek = kingSq[stm];
+        if (ok < 0 || (ek >= 0 && !(KING_ATT[ok] & bit(ek)) && attacked(ok, stm))) {
+            unmakeMove();
+            return false;
+        }
+        return true;
+    }
     if (mustTest && attacked(kingSq[stm ^ 1], stm)) {
         unmakeMove();
         return false;
@@ -797,6 +817,23 @@ bool Board::makeMove(Move m) {
         hash ^= Z_checks[mover][checks[mover]];
     }
     return true;
+}
+
+// Atomic: a capture blows up the capturing piece and every non-pawn next to the capture square.
+void Board::explode(int at, NnueAccum& acc, uint8_t& castleKeep) {
+    Blast bl;
+    Bitboard zone = bit(at) | (KING_ATT[at] & occAll & ~(pieces[WHITE][PAWN] | pieces[BLACK][PAWN]));
+    while (zone) {
+        int s = popLsb(zone), pc = sq[s];
+        bl.sq[bl.n] = int8_t(s), bl.piece[bl.n++] = int8_t(pc);
+        hash ^= Z_piece[pc][s];
+        removePiece(s);
+        pieceCount--;
+        castleKeep &= castleMask[s];
+        if (typeOf(pc) == KING) kingSq[colorOf(pc)] = -1;
+    }
+    acc.refresh = true;  // (no network for atomic, but keep the accumulator honest)
+    blastStack.push_back(bl);
 }
 
 void Board::unmakeMove() {
@@ -822,6 +859,15 @@ void Board::unmakeMove() {
         addPiece(rf, rook);
         kingSq[stm] = from;
     } else {
+        if (variant == ATOMIC && u.captured) {
+            const Blast& bl = blastStack.back();
+            for (int i = bl.n - 1; i >= 0; i--) {
+                addPiece(bl.sq[i], bl.piece[i]);
+                pieceCount++;
+                if (typeOf(bl.piece[i]) == KING) kingSq[colorOf(bl.piece[i])] = bl.sq[i];
+            }
+            blastStack.pop_back();
+        }
         int p = movePromo(m) ? makePiece(stm, PAWN) : sq[to];
         removePiece(to);
         addPiece(from, p);
@@ -874,6 +920,7 @@ int Board::variantOutcome() const {
         case KING_OF_THE_HILL: return kingSq[them] >= 0 && (bit(kingSq[them]) & CENTER) ? OUTCOME_LOSS : 0;
         case HORDE: return occ[stm] ? 0 : OUTCOME_LOSS;
         case ANTICHESS: return !occ[stm] ? OUTCOME_WIN : !occ[them] ? OUTCOME_LOSS : 0;  // lose everything to win
+        case ATOMIC: return kingSq[stm] < 0 ? OUTCOME_LOSS : kingSq[them] < 0 ? OUTCOME_WIN : 0;
         case RACING_KINGS: {
             // First king to the 8th rank wins, except that White moves first: when White gets there, Black
             // has one more move, and reaching the 8th rank with it draws.
@@ -909,6 +956,7 @@ std::string Board::variantOutcomeText() const {
     switch (variant) {
         case RACING_KINGS: return winner + " wins the race";
         case ANTICHESS: return winner + " wins - no pieces left";
+        case ATOMIC: return winner + " wins - king exploded";
         case THREE_CHECK: return winner + " wins by three checks";
         case KING_OF_THE_HILL: return winner + " wins - king reached the center";
         default: return "Black wins - the horde is destroyed";

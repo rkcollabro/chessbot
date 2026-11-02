@@ -26,6 +26,7 @@ VARIANTS = {
     "horde": (chess.variant.HordeBoard, 3),
     "racingkings": (chess.variant.RacingKingsBoard, 3),
     "antichess": (chess.variant.AntichessBoard, 3),
+    "atomic": (chess.variant.AtomicBoard, 3),
 }
 
 
