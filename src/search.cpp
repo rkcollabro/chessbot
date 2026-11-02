@@ -108,7 +108,7 @@ int tbScore(int v, int ply) {
 
 // Search features that can be switched off at build time (-DSEARCH_FEATURES=<mask>) to test them one by one.
 #ifndef SEARCH_FEATURES
-#define SEARCH_FEATURES 0x1FF
+#define SEARCH_FEATURES 0x1A7  // all but razoring (8), ProbCut (16) and history pruning (64), which failed their tests
 #endif
 constexpr int SF = SEARCH_FEATURES;
 constexpr bool F_CONT = SF & 1, F_CAP = SF & 2, F_NPCORR = SF & 4, F_RAZOR = SF & 8, F_PROBCUT = SF & 16,
