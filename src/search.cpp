@@ -106,6 +106,14 @@ int tbScore(int v, int ply) {
     return 0;
 }
 
+// Search features that can be switched off at build time (-DSEARCH_FEATURES=<mask>) to test them one by one.
+#ifndef SEARCH_FEATURES
+#define SEARCH_FEATURES 0x1FF
+#endif
+constexpr int SF = SEARCH_FEATURES;
+constexpr bool F_CONT = SF & 1, F_CAP = SF & 2, F_NPCORR = SF & 4, F_RAZOR = SF & 8, F_PROBCUT = SF & 16,
+               F_QSFUT = SF & 32, F_HISTPRUNE = SF & 64, F_EXT = SF & 128, F_TTCAP = SF & 256;
+
 // Late move reduction amounts by [depth][move number].
 int LMR[64][64];
 struct LmrInit {
@@ -340,7 +348,8 @@ public:
     int corrected(int raw) {
         int* e[3];
         corrEntries(e);
-        int c = raw + (2 * *e[0] + *e[1] + *e[2]) / (2 * CORR_GRAIN);  // pawn table weighted 1, the others 1/2
+        int c = F_NPCORR ? raw + (2 * *e[0] + *e[1] + *e[2]) / (2 * CORR_GRAIN)  // pawn weighted 1, others 1/2
+                         : raw + *e[0] / CORR_GRAIN;
         return std::max(-MATE_BOUND + 1, std::min(MATE_BOUND - 1, c));
     }
 
@@ -366,7 +375,7 @@ public:
 
     // Continuation table for the move `back` plies before this node, or null if there was none (or a null move).
     ContTable* contFor(int ply, int back) {
-        if (ply < back || !moveStack[ply - back]) return nullptr;
+        if (!F_CONT || ply < back || !moveStack[ply - back]) return nullptr;
         return &contHist[pieceStack[ply - back]][moveTo(moveStack[ply - back])];
     }
 
@@ -401,7 +410,7 @@ public:
             int victim = capturedType(m);
             int attacker = typeOf(b.sq[moveFrom(m)]);
             int mvvLva = PIECE_VALUE[victim] * 10 - PIECE_VALUE[attacker] / 100 + (promo == QUEEN ? 9000 : 0) +
-                         capHist[movingPiece(m)][moveTo(m)][victim] / 16;
+                         (F_CAP ? capHist[movingPiece(m)][moveTo(m)][victim] / 16 : 0);
             // Captures that lose material in the exchange go after the quiet moves.
             if (attacker != PAWN && PIECE_VALUE[victim] < PIECE_VALUE[attacker] && exchangeRules(b) && see(b, m) < 0)
                 return -200000 + mvvLva;
@@ -502,7 +511,7 @@ public:
                 int victim = (moveFlags(m) & MF_EP) ? PAWN : typeOf(b.sq[moveTo(m)]);
                 if (!movePromo(m) && best + PIECE_VALUE[victim] + 200 < alpha && exchangeRules(b)) continue;
                 // Futility: well short of alpha, only captures that win material can help.
-                if (!movePromo(m) && best + 150 <= alpha && exchangeRules(b) && see(b, m) <= 0) continue;
+                if (F_QSFUT && !movePromo(m) && best + 150 <= alpha && exchangeRules(b) && see(b, m) <= 0) continue;
             }
             if (!b.makeMove(m)) continue;
             ttPrefetch(b.hash);
@@ -588,7 +597,7 @@ public:
             if (depth <= 6 && std::abs(beta) < MATE_BOUND && staticEval - 85 * (depth - improving) >= beta)
                 return staticEval;
             // Razoring: far below alpha at low depth, check that captures cannot save it.
-            if (plainChess && depth <= 3 && std::abs(alpha) < MATE_BOUND && staticEval + 250 * depth <= alpha) {
+            if (F_RAZOR && plainChess && depth <= 3 && std::abs(alpha) < MATE_BOUND && staticEval + 250 * depth <= alpha) {
                 int s = qsearch(alpha, alpha + 1, ply);
                 if (stopped) return 0;
                 if (s <= alpha) return s;
@@ -607,7 +616,7 @@ public:
             }
             // ProbCut: a capture that beats beta by a margin in a reduced search almost surely beats beta.
             const int pcBeta = beta + 200;
-            if (plainChess && depth >= 5 && std::abs(beta) < MATE_BOUND &&
+            if (F_PROBCUT && plainChess && depth >= 5 && std::abs(beta) < MATE_BOUND &&
                 !(ttHit && tt.depth >= depth - 3 && ttScore < pcBeta)) {
                 MoveList pml;
                 b.genMoves(pml, true);
@@ -661,7 +670,7 @@ public:
                     // Futility pruning: a quiet move cannot lift a hopeless eval to alpha.
                     if (depth <= 6 && staticEval + 100 + 90 * depth <= alpha) continue;
                     // History pruning: quiet moves that keep failing here, at low depth.
-                    if (depth <= 4 && scores[i] < 880000 && stat < -2000 * depth) continue;
+                    if (F_HISTPRUNE && depth <= 4 && scores[i] < 880000 && stat < -2000 * depth) continue;
                 }
                 // SEE pruning: skip moves that lose too much material at low depth.
                 if (depth <= 6 && scores[i] < 900000 && exchangeRules(b) &&
@@ -679,10 +688,10 @@ public:
                 excluded[ply] = NO_MOVE;
                 if (stopped) return 0;
                 if (s < sBeta)
-                    ext = (!pvNode && s < sBeta - 25 && doubleExt[ply] < 6) ? 2 : 1;  // clearly singular: twice
+                    ext = (F_EXT && !pvNode && s < sBeta - 25 && doubleExt[ply] < 6) ? 2 : 1;  // clearly singular: twice
                 else if (sBeta >= beta)
                     return sBeta;  // multi-cut: several moves beat beta
-                else if (ttScore >= beta)
+                else if (F_EXT && ttScore >= beta)
                     ext = -1;  // not singular and others look good too: the TT move needs less depth
             }
             doubleExt[ply + 1] = doubleExt[ply] + (ext >= 2);
@@ -708,8 +717,8 @@ public:
                     if (!improving) r++;
                     if (m == killers[ply][0] || m == killers[ply][1] || m == counter) r--;
                     if (givesCheck || inCheck) r--;
-                    if (ttCapture) r++;
-                    r -= stat / 12000;
+                    if (F_TTCAP && ttCapture) r++;
+                    r -= stat / (F_CONT ? 12000 : 8000);  // without continuation tables: butterfly history as before
                     r = std::max(0, std::min(r, newDepth - 1));
                 }
                 s = -negamax(newDepth - r, -alpha - 1, -alpha, ply + 1, true);
