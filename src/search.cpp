@@ -242,6 +242,10 @@ public:
     Move killers[MAX_PLY][2];
     Move counterMoves[16][64];  // [previous moved piece][previous to-square] -> refutation
     int history[2][64][64];     // [color][from][to], bounded by gravity to +-16384
+    // Continuation history: how a quiet move has fared after a given move 1 and 2 plies earlier.
+    int16_t contHist[16][64][16][64];  // [earlier piece][earlier to][piece][to]
+    using ContTable = int16_t[16][64];
+    int16_t capHist[16][64][8];        // capture history: [moving piece][to][captured type]
 
     // Correction history: how far the static eval has been from the search result in positions with the same
     // pawn structure, as a running average in 1/CORR_GRAIN centipawns. Added to the static eval, so pruning
@@ -251,6 +255,8 @@ public:
     static constexpr int CORR_WEIGHT_SCALE = 256;
     static constexpr int CORR_MAX = CORR_GRAIN * 64;  // at most 64 centipawns either way
     int pawnCorr[2][CORR_SIZE];  // [side to move][pawn key]
+    int nonPawnCorr[2][2][CORR_SIZE];  // [side to move][piece color][that color's non-pawn piece key]
+    int doubleExt[MAX_PLY];  // double extensions taken on the path to this ply
 
     Move pv[MAX_PLY][MAX_PLY];
     int pvLen[MAX_PLY];
@@ -270,6 +276,9 @@ public:
         std::memset(counterMoves, 0, sizeof(counterMoves));
         std::memset(history, 0, sizeof(history));
         std::memset(pawnCorr, 0, sizeof(pawnCorr));
+        std::memset(contHist, 0, sizeof(contHist));
+        std::memset(capHist, 0, sizeof(capHist));
+        std::memset(nonPawnCorr, 0, sizeof(nonPawnCorr));
     }
 
     int elapsed() const {
@@ -312,18 +321,39 @@ public:
         return pawnCorr[b.stm][k & (CORR_SIZE - 1)];
     }
 
-    int corrected(int raw) {
-        int e = raw + pawnCorrEntry() / CORR_GRAIN;
-        return std::max(-MATE_BOUND + 1, std::min(MATE_BOUND - 1, e));
+    // Key of one color's non-pawn pieces (kings included), for the second and third correction tables.
+    uint64_t nonPawnKey(int c) const {
+        uint64_t k = 0;
+        for (int t = KNIGHT; t <= KING; t++) k = (k + b.pieces[c][t]) * 0x9E3779B97F4A7C15ULL;
+        k ^= k >> 31;
+        k *= 0xD6E8FEB86659FD93ULL;
+        return k ^ (k >> 32);
     }
 
-    // Move the entry toward the gap between the search result and the raw static eval, more for deeper searches.
+    // The three correction entries for this position: pawn structure, then each color's non-pawn pieces.
+    void corrEntries(int* e[3]) {
+        e[0] = &pawnCorrEntry();
+        e[1] = &nonPawnCorr[b.stm][WHITE][nonPawnKey(WHITE) & (CORR_SIZE - 1)];
+        e[2] = &nonPawnCorr[b.stm][BLACK][nonPawnKey(BLACK) & (CORR_SIZE - 1)];
+    }
+
+    int corrected(int raw) {
+        int* e[3];
+        corrEntries(e);
+        int c = raw + (2 * *e[0] + *e[1] + *e[2]) / (2 * CORR_GRAIN);  // pawn table weighted 1, the others 1/2
+        return std::max(-MATE_BOUND + 1, std::min(MATE_BOUND - 1, c));
+    }
+
+    // Move the entries toward the gap between the search result and the raw static eval, more for deeper searches.
     void updateCorrection(int raw, int score, int depth) {
-        int& c = pawnCorrEntry();
+        int* e[3];
+        corrEntries(e);
         int weight = std::min(depth + 1, 16);
         int target = (score - raw) * CORR_GRAIN;
-        c = (c * (CORR_WEIGHT_SCALE - weight) + target * weight) / CORR_WEIGHT_SCALE;
-        c = std::max(-CORR_MAX, std::min(CORR_MAX, c));
+        for (int* c : e) {
+            *c = (*c * (CORR_WEIGHT_SCALE - weight) + target * weight) / CORR_WEIGHT_SCALE;
+            *c = std::max(-CORR_MAX, std::min(CORR_MAX, *c));
+        }
     }
 
     Move counterFor(int ply) const {
@@ -331,13 +361,47 @@ public:
         return counterMoves[pieceStack[ply - 1]][moveTo(moveStack[ply - 1])];
     }
 
+    int movingPiece(Move m) const { return isDrop(m) ? makePiece(b.stm, dropType(m)) : b.sq[moveFrom(m)]; }
+    int capturedType(Move m) const { return (moveFlags(m) & MF_EP) ? PAWN : typeOf(b.sq[moveTo(m)]); }
+
+    // Continuation table for the move `back` plies before this node, or null if there was none (or a null move).
+    ContTable* contFor(int ply, int back) {
+        if (ply < back || !moveStack[ply - back]) return nullptr;
+        return &contHist[pieceStack[ply - back]][moveTo(moveStack[ply - back])];
+    }
+
+    // Combined history of a quiet move: butterfly + continuation 1 and 2 plies back.
+    int quietStat(Move m, int ply) {
+        int p = movingPiece(m), to = moveTo(m);
+        int s = history[b.stm][moveFrom(m)][to];
+        if (ContTable* c = contFor(ply, 1)) s += (*c)[p][to];
+        if (ContTable* c = contFor(ply, 2)) s += (*c)[p][to];
+        return s;
+    }
+
+    static void updateHist16(int16_t& h, int bonus) {
+        int v = h;
+        v += bonus - v * std::abs(bonus) / 16384;
+        h = int16_t(v);
+    }
+
+    void updateQuiet(Move m, int ply, int bonus) {
+        int p = movingPiece(m), to = moveTo(m);
+        updateHistory(history[b.stm][moveFrom(m)][to], bonus);
+        if (ContTable* c = contFor(ply, 1)) updateHist16((*c)[p][to], bonus);
+        if (ContTable* c = contFor(ply, 2)) updateHist16((*c)[p][to], bonus);
+    }
+
+    void updateCapture(Move m, int bonus) { updateHist16(capHist[movingPiece(m)][moveTo(m)][capturedType(m)], bonus); }
+
     int scoreMove(Move m, Move ttMove, int ply, Move counter) {
         if (m == ttMove) return 2000000;
         int promo = movePromo(m);
         if (isCapture(m)) {
-            int victim = (moveFlags(m) & MF_EP) ? PAWN : typeOf(b.sq[moveTo(m)]);
+            int victim = capturedType(m);
             int attacker = typeOf(b.sq[moveFrom(m)]);
-            int mvvLva = PIECE_VALUE[victim] * 10 - PIECE_VALUE[attacker] / 100 + (promo == QUEEN ? 9000 : 0);
+            int mvvLva = PIECE_VALUE[victim] * 10 - PIECE_VALUE[attacker] / 100 + (promo == QUEEN ? 9000 : 0) +
+                         capHist[movingPiece(m)][moveTo(m)][victim] / 16;
             // Captures that lose material in the exchange go after the quiet moves.
             if (attacker != PAWN && PIECE_VALUE[victim] < PIECE_VALUE[attacker] && exchangeRules(b) && see(b, m) < 0)
                 return -200000 + mvvLva;
@@ -348,7 +412,7 @@ public:
         if (m == killers[ply][0]) return 900000;
         if (m == killers[ply][1]) return 890000;
         if (m == counter) return 880000;
-        return history[b.stm][moveFrom(m)][moveTo(m)];
+        return quietStat(m, ply);
     }
 
     static void pickMove(MoveList& ml, int* scores, int i) {
@@ -437,10 +501,14 @@ public:
                 // Delta pruning: even winning this piece cannot lift the score to alpha.
                 int victim = (moveFlags(m) & MF_EP) ? PAWN : typeOf(b.sq[moveTo(m)]);
                 if (!movePromo(m) && best + PIECE_VALUE[victim] + 200 < alpha && exchangeRules(b)) continue;
+                // Futility: well short of alpha, only captures that win material can help.
+                if (!movePromo(m) && best + 150 <= alpha && exchangeRules(b) && see(b, m) <= 0) continue;
             }
             if (!b.makeMove(m)) continue;
             ttPrefetch(b.hash);
             legal++;
+            moveStack[ply] = m;
+            pieceStack[ply] = b.sq[moveTo(m)];
             int s = -qsearch(-beta, -alpha, ply + 1);
             b.unmakeMove();
             if (stopped) return 0;
@@ -507,6 +575,10 @@ public:
         evalStack[ply] = staticEval;
         rawEvalStack[ply] = rawEval;
         const bool improving = !inCheck && ply >= 2 && staticEval > evalStack[ply - 2];
+        if (root) doubleExt[0] = 0;
+        doubleExt[ply + 1] = doubleExt[ply];
+        // Razoring and ProbCut lean on the material-exchange model, so only in standard chess and Chess960.
+        const bool plainChess = b.variant == STANDARD || b.variant == CHESS960;
 
         // Internal iterative reduction: without a known best move, search this node a bit shallower.
         if (!ttMove && depth >= 4 && !excludedMove) depth--;
@@ -515,6 +587,12 @@ public:
             // Reverse futility pruning: far above beta at low depth.
             if (depth <= 6 && std::abs(beta) < MATE_BOUND && staticEval - 85 * (depth - improving) >= beta)
                 return staticEval;
+            // Razoring: far below alpha at low depth, check that captures cannot save it.
+            if (plainChess && depth <= 3 && std::abs(alpha) < MATE_BOUND && staticEval + 250 * depth <= alpha) {
+                int s = qsearch(alpha, alpha + 1, ply);
+                if (stopped) return 0;
+                if (s <= alpha) return s;
+            }
             // Null-move pruning.
             // (Not in antichess: zugzwang is the whole game there.)
             if (nullOk && depth >= 3 && staticEval >= beta && b.hasNonPawnMaterial(b.stm) && b.variant != ANTICHESS) {
@@ -527,6 +605,32 @@ public:
                 if (stopped) return 0;
                 if (s >= beta) return s >= MATE_BOUND ? beta : s;
             }
+            // ProbCut: a capture that beats beta by a margin in a reduced search almost surely beats beta.
+            const int pcBeta = beta + 200;
+            if (plainChess && depth >= 5 && std::abs(beta) < MATE_BOUND &&
+                !(ttHit && tt.depth >= depth - 3 && ttScore < pcBeta)) {
+                MoveList pml;
+                b.genMoves(pml, true);
+                int psc[MAX_MOVES];
+                for (int i = 0; i < pml.count; i++) psc[i] = scoreMove(pml.moves[i], ttMove, ply, NO_MOVE);
+                for (int i = 0; i < pml.count; i++) {
+                    pickMove(pml, psc, i);
+                    Move m = pml.moves[i];
+                    if (see(b, m) < pcBeta - staticEval) continue;
+                    if (!b.makeMove(m)) continue;
+                    ttPrefetch(b.hash);
+                    moveStack[ply] = m;
+                    pieceStack[ply] = b.sq[moveTo(m)];
+                    int s = -qsearch(-pcBeta, -pcBeta + 1, ply + 1);
+                    if (s >= pcBeta) s = -negamax(depth - 4, -pcBeta, -pcBeta + 1, ply + 1, true);
+                    b.unmakeMove();
+                    if (stopped) return 0;
+                    if (s >= pcBeta) {
+                        ttStore(b.hash, m, scoreToTT(s, ply), depth - 3, TT_LOWER);
+                        return s;
+                    }
+                }
+            }
         }
 
         MoveList ml;
@@ -534,17 +638,19 @@ public:
         const Move counter = counterFor(ply);
         int scores[MAX_MOVES];
         for (int i = 0; i < ml.count; i++) scores[i] = scoreMove(ml.moves[i], ttMove, ply, counter);
+        const bool ttCapture = ttMove && isCapture(ttMove);
 
         int legal = 0, best = -INF;
         Move bestMove = NO_MOVE;
-        Move quiets[64];
-        int nQuiets = 0;
+        Move quiets[64], caps[32];
+        int nQuiets = 0, nCaps = 0;
         const int origAlpha = alpha;
         for (int i = 0; i < ml.count; i++) {
             pickMove(ml, scores, i);
             Move m = ml.moves[i];
             if (m == excludedMove) continue;
             const bool quiet = !isCapture(m) && !movePromo(m);
+            const int stat = quiet ? quietStat(m, ply) : 0;
 
             // Move-level pruning once we have a move that avoids being mated.
             if (!root && legal > 0 && best > -MATE_BOUND) {
@@ -554,6 +660,8 @@ public:
                     if (depth <= 7 && nQuiets >= lmpLimit) continue;
                     // Futility pruning: a quiet move cannot lift a hopeless eval to alpha.
                     if (depth <= 6 && staticEval + 100 + 90 * depth <= alpha) continue;
+                    // History pruning: quiet moves that keep failing here, at low depth.
+                    if (depth <= 4 && scores[i] < 880000 && stat < -2000 * depth) continue;
                 }
                 // SEE pruning: skip moves that lose too much material at low depth.
                 if (depth <= 6 && scores[i] < 900000 && exchangeRules(b) &&
@@ -571,15 +679,19 @@ public:
                 excluded[ply] = NO_MOVE;
                 if (stopped) return 0;
                 if (s < sBeta)
-                    ext = 1;
+                    ext = (!pvNode && s < sBeta - 25 && doubleExt[ply] < 6) ? 2 : 1;  // clearly singular: twice
                 else if (sBeta >= beta)
                     return sBeta;  // multi-cut: several moves beat beta
+                else if (ttScore >= beta)
+                    ext = -1;  // not singular and others look good too: the TT move needs less depth
             }
+            doubleExt[ply + 1] = doubleExt[ply] + (ext >= 2);
 
             if (!b.makeMove(m)) continue;
             ttPrefetch(b.hash);
             legal++;
             if (quiet && nQuiets < 64) quiets[nQuiets++] = m;
+            if (isCapture(m) && nCaps < 32) caps[nCaps++] = m;
             moveStack[ply] = m;
             pieceStack[ply] = b.sq[moveTo(m)];
             const bool givesCheck = b.inCheck();
@@ -596,7 +708,8 @@ public:
                     if (!improving) r++;
                     if (m == killers[ply][0] || m == killers[ply][1] || m == counter) r--;
                     if (givesCheck || inCheck) r--;
-                    r -= history[b.stm ^ 1][moveFrom(m)][moveTo(m)] / 8000;
+                    if (ttCapture) r++;
+                    r -= stat / 12000;
                     r = std::max(0, std::min(r, newDepth - 1));
                 }
                 s = -negamax(newDepth - r, -alpha - 1, -alpha, ply + 1, true);
@@ -619,6 +732,7 @@ public:
                         rootScore = s;
                     }
                     if (s >= beta) {
+                        const int bonus = std::min(16 * depth * depth, 1600);
                         if (quiet) {
                             if (killers[ply][0] != m) {
                                 killers[ply][1] = killers[ply][0];
@@ -626,12 +740,10 @@ public:
                             }
                             if (ply > 0 && moveStack[ply - 1])
                                 counterMoves[pieceStack[ply - 1]][moveTo(moveStack[ply - 1])] = m;
-                            int bonus = std::min(16 * depth * depth, 1600);
-                            for (int k = 0; k < nQuiets; k++) {
-                                Move q = quiets[k];
-                                updateHistory(history[b.stm][moveFrom(q)][moveTo(q)], q == m ? bonus : -bonus);
-                            }
+                            for (int k = 0; k < nQuiets; k++) updateQuiet(quiets[k], ply, quiets[k] == m ? bonus : -bonus);
                         }
+                        // The cutoff capture is rewarded; captures tried before it (or before a quiet cutoff) lose.
+                        for (int k = 0; k < nCaps; k++) updateCapture(caps[k], caps[k] == m ? bonus : -bonus);
                         break;
                     }
                 }
