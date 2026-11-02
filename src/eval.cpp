@@ -243,6 +243,34 @@ int variantTerms(const Board& b) {
                 // without this the 36 pawns look about 7 pawns worse than Black's army at the start.
                 if (c == WHITE) score += 20 * popcount(b.bb(WHITE, PAWN));
                 break;
+            case ATOMIC: {
+                // A capture next to a king blows it up, so pieces beside our king that the opponent can take
+                // are deadly - unless the kings touch (that capture would destroy the capturer's own king too).
+                const int ek = b.kingSq[e];
+                if (k >= 0 && !(ek >= 0 && (attacks::king(k) & bit(ek)))) {
+                    int danger = 0;
+                    for (Bitboard n = attacks::king(k) & b.occAll; n;)
+                        if (b.attacked(popLsb(n), e)) danger++;
+                    score -= sign * 90 * danger;
+                }
+                break;
+            }
+            case RACING_KINGS: {
+                // Both kings race up the board, so progress counts by rank for both colors. Squares on the
+                // rank ahead that the opponent controls slow the king down; if all of them are covered it is stuck.
+                static const int RACE[8] = {0, 30, 75, 140, 230, 350, 520, 0};
+                const int r = rankOf(k);
+                score += sign * RACE[r];
+                if (r < 7) {
+                    Bitboard ahead = attacks::king(k) & rankMask(r + 1) & ~b.occ[c];
+                    int open = 0, total = popcount(ahead);
+                    for (Bitboard a = ahead; a;)
+                        if (!b.attacked(popLsb(a), e)) open++;
+                    score -= sign * (total - open) * (15 + 5 * r);
+                    if (!open) score -= sign * (40 + 15 * r);
+                }
+                break;
+            }
             default: break;
         }
     }
@@ -258,9 +286,32 @@ namespace {
 int fiftyMoveScale(const Board& b, int score) {
     return score * (200 - b.halfmove) / 200;
 }
+// Antichess, from the side to move's view. Giving pieces away is the aim, so having fewer of them is good,
+// and mobility helps: spare quiet moves are tempo, and a side with few moves is easier to force into captures.
+// Deliberately simple: the search, with compulsory captures making play very forcing, does the real work.
+int antichessEval(const Board& b) {
+    const int us = b.stm, them = us ^ 1;
+    int score = 60 * (popcount(b.occ[them]) - popcount(b.occ[us]));
+    for (int c = 0; c < 2; c++) {
+        int mob = 0;
+        for (int t = KNIGHT; t <= KING; t++)
+            for (Bitboard p = b.bb(c, t); p;) {
+                int s = popLsb(p);
+                Bitboard a = t == KNIGHT ? attacks::knight(s) : t == BISHOP ? attacks::bishop(s, b.occAll)
+                           : t == ROOK   ? attacks::rook(s, b.occAll)
+                           : t == QUEEN  ? attacks::queen(s, b.occAll)
+                                         : attacks::king(s);
+                mob += popcount(a & ~b.occAll);
+            }
+        score += (c == us ? 2 : -2) * mob;
+    }
+    return score;
+}
+
 }  // namespace
 
 int evaluate(const Board& b) {
+    if (b.variant == ANTICHESS) return fiftyMoveScale(b, antichessEval(b));
     if ((b.variant == STANDARD || b.variant == CHESS960) && nnue::active())
         return fiftyMoveScale(b, nnue::evaluate(b));
     ScoreAcc acc;

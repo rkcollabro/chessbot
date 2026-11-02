@@ -230,12 +230,12 @@ void initTables() {
 }
 
 const char* variantName(int v) {
-    static const char* N[] = {"Standard", "Chess960", "Three-check", "Crazyhouse", "King of the Hill", "Horde"};
+    static const char* N[] = {"Standard", "Chess960", "Three-check", "Crazyhouse", "King of the Hill", "Horde", "Racing Kings", "Antichess", "Atomic"};
     return v >= 0 && v < NUM_VARIANTS ? N[v] : "?";
 }
 
 const char* variantUciName(int v) {
-    static const char* N[] = {"chess", "chess960", "3check", "crazyhouse", "kingofthehill", "horde"};
+    static const char* N[] = {"chess", "chess960", "3check", "crazyhouse", "kingofthehill", "horde", "racingkings", "antichess", "atomic"};
     return v >= 0 && v < NUM_VARIANTS ? N[v] : "?";
 }
 
@@ -247,6 +247,7 @@ int variantFromUciName(const std::string& s) {
     if (l == "standard" || l == "normal") return STANDARD;
     if (l == "threecheck" || l == "three-check") return THREE_CHECK;
     if (l == "koth" || l == "king of the hill") return KING_OF_THE_HILL;
+    if (l == "racing kings" || l == "racing-kings" || l == "racingkings") return RACING_KINGS;
     return -1;
 }
 
@@ -255,6 +256,8 @@ std::string variantStartFEN(int v) {
         case THREE_CHECK: return "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 3+3 0 1";
         case CRAZYHOUSE: return "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR[] w KQkq - 0 1";
         case HORDE: return "rnbqkbnr/pppppppp/8/1PP2PP1/PPPPPPPP/PPPPPPPP/PPPPPPPP/PPPPPPPP w kq - 0 1";
+        case RACING_KINGS: return "8/8/8/8/8/8/krbnNBRK/qrbnNBRQ w - - 0 1";
+        case ANTICHESS: return "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1";
         default: return "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
     }
 }
@@ -361,7 +364,7 @@ void Board::put(int s, int piece) {
     if (piece) {
         addPiece(s, piece);
         pieceCount++;
-        if (typeOf(piece) == KING) kingSq[colorOf(piece)] = s;
+        if (typeOf(piece) == KING && variant != ANTICHESS) kingSq[colorOf(piece)] = s;
     }
 }
 
@@ -465,7 +468,10 @@ bool Board::setFEN(const std::string& fenIn) {
     }
     if (variant != CRAZYHOUSE) std::memset(pocket, 0, sizeof(pocket)), promoted = 0;
     if (variant != THREE_CHECK) checks[0] = checks[1] = 0;
-    if (kings[BLACK] != 1 || kings[WHITE] != (variant == HORDE ? 0 : 1)) return false;
+    // Antichess: any number of kings. Atomic: a king may already have exploded (the game is then over).
+    if (variant == ATOMIC ? (kings[WHITE] > 1 || kings[BLACK] > 1)
+                          : variant != ANTICHESS && (kings[BLACK] != 1 || kings[WHITE] != (variant == HORDE ? 0 : 1)))
+        return false;
     if (side != "w" && side != "b") return false;
     stm = side == "b" ? BLACK : WHITE;
     checkCache = -1;
@@ -501,7 +507,10 @@ bool Board::setFEN(const std::string& fenIn) {
     halfmove = std::max(0, hm);
     fullmove = fm < 1 ? 1 : fm;
     // The side not to move must not be in check.
-    if (kingSq[stm ^ 1] >= 0 && attacked(kingSq[stm ^ 1], stm)) return false;
+    // (Atomic: not when the kings touch, since then neither can be in check.)
+    if (kingSq[stm ^ 1] >= 0 && attacked(kingSq[stm ^ 1], stm) &&
+        !(variant == ATOMIC && kingSq[stm] >= 0 && (KING_ATT[kingSq[stm]] & bit(kingSq[stm ^ 1]))))
+        return false;
     hash = computeHash();
     return true;
 }
@@ -585,6 +594,7 @@ void Board::genMoves(MoveList& ml, bool capturesOnly) const {
     Bitboard push2 = shift(push1 & thirdRank) & empty;
     auto addPromos = [&](int from, int to, uint32_t flags) {
         for (int pr : {QUEEN, KNIGHT, ROOK, BISHOP}) ml.add(encodeMove(from, to, pr, flags));
+        if (variant == ANTICHESS) ml.add(encodeMove(from, to, KING, flags));
     };
     for (Bitboard b = push1 & promoRank; b;) {
         int to = popLsb(b);
@@ -640,6 +650,10 @@ void Board::genMoves(MoveList& ml, bool capturesOnly) const {
         }
     }
 
+    // Racing kings: a king stepping onto the 8th rank decides the game, so tactical searches need it too.
+    if (capturesOnly && variant == RACING_KINGS)
+        for (Bitboard a = KING_ATT[kingSq[us]] & rankMask(7) & empty; a;) ml.add(encodeMove(kingSq[us], popLsb(a)));
+
     // Castling (also Chess960): the king goes to the g- or c-file and the rook next to it. Every square
     // either piece crosses must be empty apart from those two, and the king may not pass through check.
     if (!capturesOnly && (castle & (us == WHITE ? 3 : 12))) {
@@ -650,7 +664,9 @@ void Board::genMoves(MoveList& ml, bool capturesOnly) const {
             const int rf = castleRook[right], kt = base + (kingSide ? 6 : 2), rt = base + (kingSide ? 5 : 3);
             if ((rankSpan(k, kt) | rankSpan(rf, rt)) & occAll & ~bit(k) & ~bit(rf)) continue;
             bool safe = true;
-            for (Bitboard path = rankSpan(k, kt); path && safe;)
+            // Atomic: squares next to the enemy king are safe (capturing there would blow up its own king).
+            const Bitboard exempt = variant == ATOMIC && kingSq[them] >= 0 ? KING_ATT[kingSq[them]] : 0;
+            for (Bitboard path = rankSpan(k, kt) & ~exempt; path && safe;)
                 if (attacked(popLsb(path), them)) safe = false;
             if (safe) ml.add(encodeMove(k, rf, 0, MF_CASTLE));
         }
@@ -663,6 +679,15 @@ void Board::genMoves(MoveList& ml, bool capturesOnly) const {
             Bitboard to = empty & (t == PAWN ? ~(rankMask(0) | rankMask(7)) : ~Bitboard(0));
             while (to) ml.add(encodeDrop(popLsb(to), t));
         }
+    }
+
+    // Antichess: capturing is compulsory, so when any capture exists only the captures are moves.
+    // (There is no check, so every move generated here is legal.)
+    if (variant == ANTICHESS) {
+        int n = 0;
+        for (int i = 0; i < ml.count; i++)
+            if (isCapture(ml.moves[i])) ml.moves[n++] = ml.moves[i];
+        if (n) ml.count = n;
     }
 }
 
@@ -743,7 +768,7 @@ bool Board::makeMove(Move m) {
         dirty(acc, np, to, 1);
         addPiece(to, np);
         hash ^= Z_piece[np][to];
-        if (typeOf(p) == KING) kingSq[stm] = to;
+        if (typeOf(p) == KING && variant != ANTICHESS) kingSq[stm] = to;
         if (variant == CRAZYHOUSE) {
             if (promoted & bit(from))
                 promoted ^= bit(from) | bit(to);
@@ -751,8 +776,10 @@ bool Board::makeMove(Move m) {
                 promoted |= bit(to);
         }
     }
+    uint8_t blastKeep = 0xFF;
+    if (variant == ATOMIC && cap) explode(to, acc, blastKeep);
     hash ^= Z_castle[castle];
-    castle &= castleMask[from] & castleMask[to];
+    castle &= castleMask[from] & castleMask[to] & blastKeep;
     hash ^= Z_castle[castle];
     ep = -1;
     if (flags & MF_DOUBLE) {
@@ -765,7 +792,21 @@ bool Board::makeMove(Move m) {
     hash ^= Z_side;
     checkCache = -1;
 
+    if (variant == ATOMIC) {
+        // Illegal if our own king blew up, or is left in check (impossible while the kings touch).
+        // Blowing up the enemy king wins on the spot, whatever else is attacked.
+        const int us = stm ^ 1, ok = kingSq[us], ek = kingSq[stm];
+        if (ok < 0 || (ek >= 0 && !(KING_ATT[ok] & bit(ek)) && attacked(ok, stm))) {
+            unmakeMove();
+            return false;
+        }
+        return true;
+    }
     if (mustTest && attacked(kingSq[stm ^ 1], stm)) {
+        unmakeMove();
+        return false;
+    }
+    if (variant == RACING_KINGS && inCheck()) {  // racing kings: giving check is illegal
         unmakeMove();
         return false;
     }
@@ -776,6 +817,23 @@ bool Board::makeMove(Move m) {
         hash ^= Z_checks[mover][checks[mover]];
     }
     return true;
+}
+
+// Atomic: a capture blows up the capturing piece and every non-pawn next to the capture square.
+void Board::explode(int at, NnueAccum& acc, uint8_t& castleKeep) {
+    Blast bl;
+    Bitboard zone = bit(at) | (KING_ATT[at] & occAll & ~(pieces[WHITE][PAWN] | pieces[BLACK][PAWN]));
+    while (zone) {
+        int s = popLsb(zone), pc = sq[s];
+        bl.sq[bl.n] = int8_t(s), bl.piece[bl.n++] = int8_t(pc);
+        hash ^= Z_piece[pc][s];
+        removePiece(s);
+        pieceCount--;
+        castleKeep &= castleMask[s];
+        if (typeOf(pc) == KING) kingSq[colorOf(pc)] = -1;
+    }
+    acc.refresh = true;  // (no network for atomic, but keep the accumulator honest)
+    blastStack.push_back(bl);
 }
 
 void Board::unmakeMove() {
@@ -801,10 +859,19 @@ void Board::unmakeMove() {
         addPiece(rf, rook);
         kingSq[stm] = from;
     } else {
+        if (variant == ATOMIC && u.captured) {
+            const Blast& bl = blastStack.back();
+            for (int i = bl.n - 1; i >= 0; i--) {
+                addPiece(bl.sq[i], bl.piece[i]);
+                pieceCount++;
+                if (typeOf(bl.piece[i]) == KING) kingSq[colorOf(bl.piece[i])] = bl.sq[i];
+            }
+            blastStack.pop_back();
+        }
         int p = movePromo(m) ? makePiece(stm, PAWN) : sq[to];
         removePiece(to);
         addPiece(from, p);
-        if (typeOf(p) == KING) kingSq[stm] = from;
+        if (typeOf(p) == KING && variant != ANTICHESS) kingSq[stm] = from;
         if (u.captured) {
             int capSq = (flags & MF_EP) ? to + (stm == WHITE ? -8 : 8) : to;
             addPiece(capSq, u.captured);
@@ -849,17 +916,47 @@ void Board::unmakeNull() {
 int Board::variantOutcome() const {
     const int them = stm ^ 1;
     switch (variant) {
-        case THREE_CHECK: return checks[them] >= 3 ? -1 : 0;
-        case KING_OF_THE_HILL: return kingSq[them] >= 0 && (bit(kingSq[them]) & CENTER) ? -1 : 0;
-        case HORDE: return occ[stm] ? 0 : -1;
+        case THREE_CHECK: return checks[them] >= 3 ? OUTCOME_LOSS : 0;
+        case KING_OF_THE_HILL: return kingSq[them] >= 0 && (bit(kingSq[them]) & CENTER) ? OUTCOME_LOSS : 0;
+        case HORDE: return occ[stm] ? 0 : OUTCOME_LOSS;
+        case ANTICHESS: return !occ[stm] ? OUTCOME_WIN : !occ[them] ? OUTCOME_LOSS : 0;  // lose everything to win
+        case ATOMIC: return kingSq[stm] < 0 ? OUTCOME_LOSS : kingSq[them] < 0 ? OUTCOME_WIN : 0;
+        case RACING_KINGS: {
+            // First king to the 8th rank wins, except that White moves first: when White gets there, Black
+            // has one more move, and reaching the 8th rank with it draws.
+            const bool whiteHome = rankOf(kingSq[WHITE]) == 7, blackHome = rankOf(kingSq[BLACK]) == 7;
+            if (whiteHome && blackHome) return OUTCOME_DRAW;
+            if (blackHome) return stm == BLACK ? OUTCOME_WIN : OUTCOME_LOSS;
+            if (!whiteHome) return 0;
+            if (stm == WHITE) return OUTCOME_WIN;
+            return raceKingCanFinish() ? 0 : OUTCOME_LOSS;
+        }
         default: return 0;
     }
 }
 
+bool Board::raceKingCanFinish() const {
+    Board& b = const_cast<Board&>(*this);  // makeMove/unmakeMove leave the position exactly as it was
+    const int k = kingSq[stm];
+    for (Bitboard to = attacks::king(k) & rankMask(7) & ~occ[stm]; to;) {
+        int t = popLsb(to);
+        if (b.makeMove(encodeMove(k, t, 0, sq[t] ? MF_CAPTURE : 0))) {
+            b.unmakeMove();
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string Board::variantOutcomeText() const {
-    if (!variantOutcome()) return {};
-    std::string winner = stm == WHITE ? "Black" : "White";
+    const int o = variantOutcome();
+    if (!o) return {};
+    if (o == OUTCOME_DRAW) return "Draw - both kings reached the 8th rank";
+    std::string winner = (stm == WHITE) == (o == OUTCOME_LOSS) ? "Black" : "White";
     switch (variant) {
+        case RACING_KINGS: return winner + " wins the race";
+        case ANTICHESS: return winner + " wins - no pieces left";
+        case ATOMIC: return winner + " wins - king exploded";
         case THREE_CHECK: return winner + " wins by three checks";
         case KING_OF_THE_HILL: return winner + " wins - king reached the center";
         default: return "Black wins - the horde is destroyed";

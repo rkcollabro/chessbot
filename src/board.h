@@ -10,12 +10,15 @@
 enum Color : int { WHITE = 0, BLACK = 1 };
 
 // Rule sets. Standard and Chess960 share everything except the start position and castling setup.
-enum Variant : int { STANDARD = 0, CHESS960, THREE_CHECK, CRAZYHOUSE, KING_OF_THE_HILL, HORDE, NUM_VARIANTS };
+enum Variant : int {
+    STANDARD = 0, CHESS960, THREE_CHECK, CRAZYHOUSE, KING_OF_THE_HILL, HORDE, RACING_KINGS, ANTICHESS, ATOMIC, NUM_VARIANTS
+};
 const char* variantName(int v);     // "Three-check"
 const char* variantUciName(int v);  // "3check", as UCI_Variant / lichess name it
 int variantFromUciName(const std::string& s);  // -1 if unknown
 std::string variantStartFEN(int v);
 std::string chess960StartFEN(int n);  // Scharnagl numbering 0..959; 518 is the standard position
+constexpr int OUTCOME_LOSS = -1, OUTCOME_WIN = 1, OUTCOME_DRAW = 2;  // Board::variantOutcome()
 enum PieceType : int { NO_TYPE = 0, PAWN = 1, KNIGHT = 2, BISHOP = 3, ROOK = 4, QUEEN = 5, KING = 6 };
 
 // Piece code = type | color << 3. White pieces are 1..6, black 9..14, 0 is empty.
@@ -148,12 +151,18 @@ public:
     int halfmove = 0;
     int fullmove = 1;
     uint64_t hash = 0;
-    int kingSq[2] = {-1, -1};  // -1 for White in horde
+    int kingSq[2] = {-1, -1};  // -1 for White in horde, and for both in antichess (any number of ordinary kings)
     int pieceCount = 0;  // all pieces including kings
     mutable int checkCache = -1;  // -1 unknown, else whether the side to move is in check
     std::vector<Undo> undoStack;
     std::vector<uint64_t> hashHistory;  // hash before each move made
     mutable std::vector<NnueAccum> nnueStack;  // indexed by undoStack.size()
+    // Atomic: what each capture blew up (the capturing piece and the non-pawns around it), for unmakeMove.
+    struct Blast {
+        int n = 0;
+        int8_t sq[9], piece[9];
+    };
+    std::vector<Blast> blastStack;
 
     Board();
     void clear();
@@ -167,8 +176,13 @@ public:
     Bitboard attackersTo(int s, Bitboard occupancy) const;  // both colors
     bool attacked(int s, int byColor) const;
     bool inCheck() const {
-        if (checkCache < 0) checkCache = kingSq[stm] >= 0 && attacked(kingSq[stm], stm ^ 1) ? 1 : 0;
+        if (checkCache < 0)
+            checkCache = kingSq[stm] >= 0 && attacked(kingSq[stm], stm ^ 1) && !kingsTouch() ? 1 : 0;
         return checkCache != 0;
+    }
+    // Atomic: kings standing next to each other cannot be checked (capturing one would blow up the other).
+    bool kingsTouch() const {
+        return variant == ATOMIC && kingSq[stm ^ 1] >= 0 && (attacks::king(kingSq[stm]) & bit(kingSq[stm ^ 1]));
     }
 
     // Pseudo-legal moves. capturesOnly also includes promotions.
@@ -181,9 +195,11 @@ public:
     void makeNull();
     void unmakeNull();
 
-    // Game won or lost by a variant rule (three checks, king on the hill, horde wiped out):
-    // -1 if the side to move has lost, 0 otherwise. Checkmate and stalemate are not included.
+    // Game decided by a variant rule (three checks, king on the hill, horde wiped out, a king home in the race):
+    // OUTCOME_LOSS / OUTCOME_WIN for the side to move, OUTCOME_DRAW, or 0 while the game goes on.
+    // Checkmate and stalemate are not included. Any non-zero value means the game is over.
     int variantOutcome() const;
+    bool raceKingCanFinish() const;  // racing kings: the side to move's king can legally step onto the 8th rank
     std::string variantOutcomeText() const;  // "White wins by three checks", or empty
 
     bool isRepetition() const;
@@ -201,6 +217,7 @@ private:
     void removePiece(int s);
     void changePocket(int c, int t, int delta);
     void castleSquares(Move m, int& kingTo, int& rookFrom, int& rookTo) const;
+    void explode(int at, NnueAccum& acc, uint8_t& castleKeep);
     NnueAccum& pushAccum();
     static void dirty(NnueAccum& a, int piece, int s, int sign) {
         if (a.ndirty == 4) {

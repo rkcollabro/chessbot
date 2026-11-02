@@ -4,7 +4,7 @@ Plays random games in each variant, and at sampled positions compares perft coun
 `chesscli perft <depth> --variant <name> <fen>` with python-chess. On a mismatch it prints the
 per-move breakdown (divide) so the offending move is easy to find.
 
-    python tools/variant_perft.py [games_per_variant] [seed]
+    python tools/variant_perft.py [games_per_variant] [seed] [variant,...]
 """
 import random
 import subprocess
@@ -24,6 +24,9 @@ VARIANTS = {
     "crazyhouse": (chess.variant.CrazyhouseBoard, 2),
     "kingofthehill": (chess.variant.KingOfTheHillBoard, 3),
     "horde": (chess.variant.HordeBoard, 3),
+    "racingkings": (chess.variant.RacingKingsBoard, 3),
+    "antichess": (chess.variant.AntichessBoard, 3),
+    "atomic": (chess.variant.AtomicBoard, 3),
 }
 
 
@@ -70,8 +73,11 @@ def start_fen(name, rng):
 def main():
     games = int(sys.argv[1]) if len(sys.argv) > 1 else 6
     rng = random.Random(int(sys.argv[2]) if len(sys.argv) > 2 else 1)
+    only = set(sys.argv[3].split(",")) if len(sys.argv) > 3 else set(VARIANTS)
     failures = 0
     for name, (factory, depth) in VARIANTS.items():
+        if name not in only:
+            continue
         checked = 0
         for _ in range(games):
             board = factory(start_fen(name, rng))
