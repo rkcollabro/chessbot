@@ -26,6 +26,7 @@ import torch
 
 HIDDEN = 256
 BUCKETS = 1
+QB_OUT = 64  # output-layer quantization written to the file (QB is the original format's fixed 64)
 INPUTS = 768
 PAD = INPUTS  # feature index for empty slots
 QA, QB, SCALE = 255, 64, 400
@@ -90,13 +91,13 @@ def export(net, path):
     w = net.ft.weight.detach().cpu().numpy()[:INPUTS]
     ft_w = np.clip(np.round(w * QA), -32768, 32767).astype("<i2")
     ft_b = np.clip(np.round(net.ft_bias.detach().cpu().numpy() * QA), -32768, 32767).astype("<i2")
-    out_w = np.clip(np.round(net.out.weight.detach().cpu().numpy() * QB), -32768, 32767).astype("<i2")  # [B][2H]
-    out_b = np.round(net.out.bias.detach().cpu().numpy().astype(np.float64) * QA * QB).astype("<i4")
+    out_w = np.clip(np.round(net.out.weight.detach().cpu().numpy() * QB_OUT), -32768, 32767).astype("<i2")  # [B][2H]
+    out_b = np.round(net.out.bias.detach().cpu().numpy().astype(np.float64) * QA * QB_OUT).astype("<i4")
     with open(path, "wb") as f:
-        if BUCKETS == 1:  # original format, readable by older engines
+        if BUCKETS == 1 and QB_OUT == QB:  # original format, readable by older engines
             f.write(b"CBNN" + struct.pack("<i", HIDDEN))
         else:
-            f.write(b"CBNB" + struct.pack("<ii", HIDDEN, BUCKETS))
+            f.write(b"CBNB" + struct.pack("<iii", HIDDEN, BUCKETS, QB_OUT))
         f.write(ft_w.tobytes() + ft_b.tobytes() + out_w.tobytes() + out_b.tobytes())
 
 
@@ -113,13 +114,15 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--buckets", type=int, default=1, help="output buckets by piece count (1 = single output)")
+    ap.add_argument("--qb", type=int, default=QB, help="output-layer quantization in the exported file (64 = original)")
     ap.add_argument("--init", help="start from this .pt state dict (same --hidden) instead of random weights; "
                                    "a single-output network's output is copied into every bucket")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--seed", type=int, default=1)
     args = ap.parse_args()
     global HIDDEN, BUCKETS
-    HIDDEN, BUCKETS = args.hidden, args.buckets
+    global QB_OUT
+    HIDDEN, BUCKETS, QB_OUT = args.hidden, args.buckets, args.qb
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     device = torch.device(args.device)

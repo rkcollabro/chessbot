@@ -19,7 +19,7 @@ namespace {
 constexpr int INPUTS = 768;  // [own/enemy][piece type - 1][square], squares mirrored for Black
 constexpr int HIDDEN = NNUE_HIDDEN;
 constexpr int QA = 255;      // feature-transformer quantization
-constexpr int QB = 64;       // output-layer quantization
+constexpr int QB_DEFAULT = 64;  // output-layer quantization of "CBNN" files; "CBNB" files give their own
 constexpr int SCALE = 400;   // network output 1.0 = 400 centipawns
 
 constexpr int MAX_BUCKETS = 16;
@@ -28,6 +28,7 @@ struct Net {
     std::vector<int16_t> ftWeights;  // [INPUTS][HIDDEN]
     int16_t ftBias[HIDDEN];
     int buckets = 1;  // output buckets, chosen by the number of pieces on the board
+    int qb = QB_DEFAULT;
     std::vector<int16_t> outWeights;  // [buckets][2 * HIDDEN], side to move's half first
     int32_t outBias[MAX_BUCKETS];
 };
@@ -48,17 +49,19 @@ bool load(const std::string& path) {
     g_loaded = false;
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
-    // "CBNN" hidden: single output. "CBNB" hidden buckets: one output per piece-count bucket.
+    // "CBNN" hidden: single output, QB 64. "CBNB" hidden buckets qb: one output per piece-count bucket, output
+    // weights scaled by qb.
     char magic[4];
-    int32_t hidden = 0, buckets = 1;
+    int32_t hidden = 0, buckets = 1, qb = QB_DEFAULT;
     bool ok = std::fread(magic, 1, 4, f) == 4 && std::fread(&hidden, 4, 1, f) == 1;
     if (ok && std::memcmp(magic, "CBNB", 4) == 0)
-        ok = std::fread(&buckets, 4, 1, f) == 1;
+        ok = std::fread(&buckets, 4, 1, f) == 1 && std::fread(&qb, 4, 1, f) == 1 && qb >= 1 && qb <= 4096;
     else
         ok = ok && std::memcmp(magic, "CBNN", 4) == 0;
     ok = ok && hidden == HIDDEN && buckets >= 1 && buckets <= MAX_BUCKETS;
     if (ok) {
         g_net.buckets = buckets;
+        g_net.qb = qb;
         g_net.ftWeights.resize(size_t(INPUTS) * HIDDEN);
         g_net.outWeights.resize(size_t(buckets) * 2 * HIDDEN);
         ok = std::fread(g_net.ftWeights.data(), 2, g_net.ftWeights.size(), f) == g_net.ftWeights.size() &&
@@ -177,7 +180,7 @@ int evaluate(const Board& b) {
     bucket = bucket < 0 ? 0 : bucket >= g_net.buckets ? g_net.buckets - 1 : bucket;  // same as the trainer
     const int16_t* w = &g_net.outWeights[size_t(bucket) * 2 * HIDDEN];
     int64_t out = int64_t(dotClamped(a.v[b.stm], w)) + dotClamped(a.v[b.stm ^ 1], w + HIDDEN) + g_net.outBias[bucket];
-    return int(out * SCALE / (QA * QB));
+    return int(out * SCALE / (QA * g_net.qb));
 }
 
 }  // namespace nnue
