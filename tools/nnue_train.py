@@ -4,6 +4,9 @@ Network: 768 inputs per side (own/enemy x piece type x square, mirrored for Blac
 clipped ReLU, the side to move's and the opponent's halves concatenated -> 1 output, 1.0 = 400 centipawns.
 With --buckets N the output layer has N sets of weights, picked by the number of pieces on the board
 (bucket = min(N - 1, (pieces - 2) * N // 32)), so openings, middlegames and endgames get their own output.
+With --king-buckets 4m each side's inputs get their own weights per region of its own king square (back rank
+a-b, back rank c-d, second rank, further up), mirrored left to right so a king on files e-h uses the a-d weights
+with every square flipped.
 The target mixes the engine's search score and the game result:
     target = LAMBDA * sigmoid(score / 400) + (1 - LAMBDA) * result
 Endgame positions (at most --endgame-pieces pieces) can use their own --lambda-endgame. Self-play used to shuffle
@@ -27,8 +30,24 @@ import torch
 HIDDEN = 256
 BUCKETS = 1
 QB_OUT = 64  # output-layer quantization written to the file (QB is the original format's fixed 64)
-INPUTS = 768
-PAD = INPUTS  # feature index for empty slots
+INPUTS = 768         # per king bucket
+KBUCKETS = 1
+MIRROR = False
+KING_LAYOUT = np.zeros(64, dtype=np.uint8)  # king square (own point of view, after mirroring) -> king bucket
+PAD = INPUTS  # feature index for empty slots (INPUTS * KBUCKETS)
+
+
+def king_layout(name):
+    """(buckets, mirror, layout) for a --king-buckets name."""
+    if name == "none":
+        return 1, False, np.zeros(64, dtype=np.uint8)
+    if name == "4m":
+        lay = np.full(64, 3, dtype=np.uint8)
+        lay[8:16] = 2
+        lay[[0, 1, 6, 7]] = 0
+        lay[[2, 3, 4, 5]] = 1
+        return 4, True, lay
+    raise SystemExit(f"unknown --king-buckets {name}")
 QA, QB, SCALE = 255, 64, 400
 RECORD = np.dtype([("sq", "u1", 32), ("pc", "u1", 32), ("score", "<i2"), ("result", "u1"), ("stm", "u1")])
 CHUNK = 1 << 20      # positions read from one file at a time
@@ -53,11 +72,20 @@ class Batchify:
 
         empty = pc == 0xFF
         color, ptype = pc >> 3, pc & 7
+        layout = torch.from_numpy(KING_LAYOUT.astype(np.int64)).to(d)
 
         def feats(persp):
             p = persp[:, None]
             square = torch.where(p == 0, sq, sq ^ 56)
-            idx = (color != p).long() * 384 + (ptype - 1) * 64 + square
+            base = 0
+            if KBUCKETS > 1 or MIRROR:
+                own_king = (~empty) & (color == p) & (ptype == 6)
+                ksq = (square * own_king).sum(dim=1, keepdim=True)  # exactly one king per side
+                if MIRROR:
+                    flip = ((ksq & 7) >= 4).long() * 7
+                    square, ksq = square ^ flip, ksq ^ flip
+                base = layout[ksq] * INPUTS
+            idx = base + (color != p).long() * 384 + (ptype - 1) * 64 + square
             return idx.masked_fill(empty, PAD)
 
         us, them = feats(stm), feats(1 - stm)
@@ -73,7 +101,7 @@ class Batchify:
 class Net(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.ft = torch.nn.EmbeddingBag(INPUTS + 1, HIDDEN, mode="sum", padding_idx=PAD)
+        self.ft = torch.nn.EmbeddingBag(INPUTS * KBUCKETS + 1, HIDDEN, mode="sum", padding_idx=PAD)
         self.ft_bias = torch.nn.Parameter(torch.zeros(HIDDEN))
         self.out = torch.nn.Linear(2 * HIDDEN, BUCKETS)
         torch.nn.init.normal_(self.ft.weight, std=0.05)
@@ -88,13 +116,16 @@ class Net(torch.nn.Module):
 
 
 def export(net, path):
-    w = net.ft.weight.detach().cpu().numpy()[:INPUTS]
+    w = net.ft.weight.detach().cpu().numpy()[:INPUTS * KBUCKETS]
     ft_w = np.clip(np.round(w * QA), -32768, 32767).astype("<i2")
     ft_b = np.clip(np.round(net.ft_bias.detach().cpu().numpy() * QA), -32768, 32767).astype("<i2")
     out_w = np.clip(np.round(net.out.weight.detach().cpu().numpy() * QB_OUT), -32768, 32767).astype("<i2")  # [B][2H]
     out_b = np.round(net.out.bias.detach().cpu().numpy().astype(np.float64) * QA * QB_OUT).astype("<i4")
     with open(path, "wb") as f:
-        if BUCKETS == 1 and QB_OUT == QB:  # original format, readable by older engines
+        if KBUCKETS > 1 or MIRROR:
+            f.write(b"CBNK" + struct.pack("<iiiii", HIDDEN, BUCKETS, QB_OUT, KBUCKETS, int(MIRROR)) +
+                    KING_LAYOUT.astype("u1").tobytes())
+        elif BUCKETS == 1 and QB_OUT == QB:  # original format, readable by older engines
             f.write(b"CBNN" + struct.pack("<i", HIDDEN))
         else:
             f.write(b"CBNB" + struct.pack("<iii", HIDDEN, BUCKETS, QB_OUT))
@@ -114,6 +145,7 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--buckets", type=int, default=1, help="output buckets by piece count (1 = single output)")
+    ap.add_argument("--king-buckets", default="none", help="king-square input buckets: none, or 4m (4, mirrored)")
     ap.add_argument("--qb", type=int, default=QB, help="output-layer quantization in the exported file (64 = original)")
     ap.add_argument("--init", help="start from this .pt state dict (same --hidden) instead of random weights; "
                                    "a single-output network's output is copied into every bucket")
@@ -121,8 +153,10 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     args = ap.parse_args()
     global HIDDEN, BUCKETS
-    global QB_OUT
+    global QB_OUT, KBUCKETS, MIRROR, KING_LAYOUT, PAD
     HIDDEN, BUCKETS, QB_OUT = args.hidden, args.buckets, args.qb
+    KBUCKETS, MIRROR, KING_LAYOUT = king_layout(args.king_buckets)
+    PAD = INPUTS * KBUCKETS
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     device = torch.device(args.device)

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -23,9 +24,16 @@ constexpr int QB_DEFAULT = 64;  // output-layer quantization of "CBNN" files; "C
 constexpr int SCALE = 400;   // network output 1.0 = 400 centipawns
 
 constexpr int MAX_BUCKETS = 16;
+constexpr int MAX_KBUCKETS = 32;
 
 struct Net {
-    std::vector<int16_t> ftWeights;  // [INPUTS][HIDDEN]
+    // King buckets ("CBNK" files): each side's inputs get their own weights per region of that side's king
+    // square (kingBucket, from that side's point of view). With mirror, a king on files e-h flips every square
+    // left to right first, so only files a-d need weights.
+    int kbuckets = 1;
+    bool mirror = false;
+    uint8_t kingBucket[64] = {};
+    std::vector<int16_t> ftWeights;  // [kbuckets][INPUTS][HIDDEN]
     int16_t ftBias[HIDDEN];
     int buckets = 1;  // output buckets, chosen by the number of pieces on the board
     int qb = QB_DEFAULT;
@@ -37,10 +45,23 @@ Net g_net;
 bool g_loaded = false;
 bool g_enabled = true;
 
-inline int feature(int perspective, int piece, int sq) {
+// One side's view of its own king: the weight set to use (bucket * INPUTS) and the left-right flip (0 or 7).
+struct KingView {
+    int base, flip;
+    bool operator!=(const KingView& o) const { return base != o.base || flip != o.flip; }
+};
+
+inline KingView kingView(int perspective, int ksq) {
+    if (ksq < 0) return {0, 0};
+    int k = perspective == WHITE ? ksq : ksq ^ 56;
+    int flip = g_net.mirror && (k & 7) >= 4 ? 7 : 0;
+    return {g_net.kingBucket[k ^ flip] * INPUTS, flip};
+}
+
+inline int feature(int perspective, const KingView& kv, int piece, int sq) {
     int c = piece >> 3, t = piece & 7;
-    int s = perspective == WHITE ? sq : sq ^ 56;
-    return (c == perspective ? 0 : 384) + (t - 1) * 64 + s;
+    int s = (perspective == WHITE ? sq : sq ^ 56) ^ kv.flip;
+    return kv.base + (c == perspective ? 0 : 384) + (t - 1) * 64 + s;
 }
 
 }  // namespace
@@ -50,19 +71,28 @@ bool load(const std::string& path) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
     // "CBNN" hidden: single output, QB 64. "CBNB" hidden buckets qb: one output per piece-count bucket, output
-    // weights scaled by qb.
+    // weights scaled by qb. "CBNK" hidden buckets qb kbuckets mirror kingBucket[64]: CBNB plus king buckets.
     char magic[4];
-    int32_t hidden = 0, buckets = 1, qb = QB_DEFAULT;
+    int32_t hidden = 0, buckets = 1, qb = QB_DEFAULT, kbuckets = 1, mirror = 0;
+    uint8_t layout[64] = {};
     bool ok = std::fread(magic, 1, 4, f) == 4 && std::fread(&hidden, 4, 1, f) == 1;
-    if (ok && std::memcmp(magic, "CBNB", 4) == 0)
+    bool kb = ok && std::memcmp(magic, "CBNK", 4) == 0;
+    if (ok && (kb || std::memcmp(magic, "CBNB", 4) == 0))
         ok = std::fread(&buckets, 4, 1, f) == 1 && std::fread(&qb, 4, 1, f) == 1 && qb >= 1 && qb <= 4096;
     else
         ok = ok && std::memcmp(magic, "CBNN", 4) == 0;
+    if (ok && kb)
+        ok = std::fread(&kbuckets, 4, 1, f) == 1 && std::fread(&mirror, 4, 1, f) == 1 &&
+             std::fread(layout, 1, 64, f) == 64 && kbuckets >= 1 && kbuckets <= MAX_KBUCKETS;
+    for (int i = 0; ok && i < 64; i++) ok = layout[i] < kbuckets;
     ok = ok && hidden == HIDDEN && buckets >= 1 && buckets <= MAX_BUCKETS;
     if (ok) {
         g_net.buckets = buckets;
         g_net.qb = qb;
-        g_net.ftWeights.resize(size_t(INPUTS) * HIDDEN);
+        g_net.kbuckets = kbuckets;
+        g_net.mirror = mirror != 0;
+        std::memcpy(g_net.kingBucket, layout, 64);
+        g_net.ftWeights.resize(size_t(kbuckets) * INPUTS * HIDDEN);
         g_net.outWeights.resize(size_t(buckets) * 2 * HIDDEN);
         ok = std::fread(g_net.ftWeights.data(), 2, g_net.ftWeights.size(), f) == g_net.ftWeights.size() &&
              std::fread(g_net.ftBias, 2, HIDDEN, f) == HIDDEN &&
@@ -83,23 +113,40 @@ namespace {
 void refresh(const Board& b, NnueAccum& a) {
     for (int p = 0; p < 2; p++)
         for (int i = 0; i < HIDDEN; i++) a.v[p][i] = g_net.ftBias[i];
+    const KingView kv[2] = {kingView(WHITE, b.kingSq[WHITE]), kingView(BLACK, b.kingSq[BLACK])};
     for (Bitboard occ = b.occAll; occ;) {
         int s = popLsb(occ);
         int piece = b.sq[s];
         for (int p = 0; p < 2; p++) {
-            const int16_t* w = &g_net.ftWeights[size_t(feature(p, piece, s)) * HIDDEN];
+            const int16_t* w = &g_net.ftWeights[size_t(feature(p, kv[p], piece, s)) * HIDDEN];
             for (int i = 0; i < HIDDEN; i++) a.v[p][i] += w[i];
         }
     }
     a.computed = true;
 }
 
-// a = parent plus the pieces a's move added, minus the ones it removed, done in one pass over the sums.
-void update(const NnueAccum& parent, NnueAccum& a) {
+// Whether a's move took a king into a different bucket or mirror half, which changes every input of that side:
+// such a position is rebuilt from the board instead of updated.
+bool kingViewChanged(const NnueAccum& a) {
+    if (g_net.kbuckets == 1 && !g_net.mirror) return false;
+    for (int d = 0; d < a.ndirty; d++) {
+        if ((a.dirtyPiece[d] & 7) != KING || a.dirtySign[d] > 0) continue;
+        for (int e = 0; e < a.ndirty; e++)
+            if (a.dirtyPiece[e] == a.dirtyPiece[d] && a.dirtySign[e] > 0) {
+                int c = a.dirtyPiece[d] >> 3;  // a king move only changes its own side's view
+                if (kingView(c, a.dirtySq[d]) != kingView(c, a.dirtySq[e])) return true;
+            }
+    }
+    return false;
+}
+
+// a = parent plus the pieces a's move added, minus the ones it removed, done in one pass over the sums. kv is
+// each side's king view, the same for parent and a (moves that change it are rebuilt instead).
+void update(const NnueAccum& parent, NnueAccum& a, const KingView* kv) {
     const int16_t* w[4];
     for (int p = 0; p < 2; p++) {
         for (int d = 0; d < a.ndirty; d++)
-            w[d] = &g_net.ftWeights[size_t(feature(p, a.dirtyPiece[d], a.dirtySq[d])) * HIDDEN];
+            w[d] = &g_net.ftWeights[size_t(feature(p, kv[p], a.dirtyPiece[d], a.dirtySq[d])) * HIDDEN];
         const int16_t* src = parent.v[p];
         int16_t* dst = a.v[p];
 #if defined(NNUE_AVX2)
@@ -169,13 +216,25 @@ int evaluate(const Board& b) {
     const int top = int(b.undoStack.size());
     // Walk back to the nearest position whose sums are known; a long walk costs more than a rebuild.
     int k = top;
-    while (k > 0 && !st[k].computed && !st[k].refresh && top - k < 16) k--;
+    while (k > 0 && !st[k].computed && !st[k].refresh && !kingViewChanged(st[k]) && top - k < 16) k--;
     if (st[k].computed) {
-        for (int j = k + 1; j <= top; j++) update(st[j - 1], st[j]);
+        // No move after k changed a king view, so every position on the way shares the current one.
+        const KingView kv[2] = {kingView(WHITE, b.kingSq[WHITE]), kingView(BLACK, b.kingSq[BLACK])};
+        for (int j = k + 1; j <= top; j++) update(st[j - 1], st[j], kv);
     } else {
         refresh(b, st[top]);
     }
     const NnueAccum& a = st[top];
+#ifdef NNUE_VERIFY  // debug builds: the incremental sums must equal a rebuild from the board
+    {
+        static thread_local NnueAccum fresh;
+        refresh(b, fresh);
+        if (std::memcmp(fresh.v, a.v, sizeof(a.v)) != 0) {
+            std::fprintf(stderr, "NNUE accumulator mismatch at ply %d\n", top);
+            std::abort();
+        }
+    }
+#endif
     int bucket = (popcount(b.occAll) - 2) * g_net.buckets / 32;
     bucket = bucket < 0 ? 0 : bucket >= g_net.buckets ? g_net.buckets - 1 : bucket;  // same as the trainer
     const int16_t* w = &g_net.outWeights[size_t(bucket) * 2 * HIDDEN];
