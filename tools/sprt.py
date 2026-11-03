@@ -32,8 +32,11 @@ def to_elo(score):
     return -400 * math.log10(1 / score - 1)
 
 
-def play(engines, opening, tc):
-    """One game; engines = {chess.WHITE: engine, chess.BLACK: engine}. Returns "1-0", "0-1" or "1/2-1/2"."""
+def play(engines, opening, tc, settings=None):
+    """One game; engines = {chess.WHITE: engine, chess.BLACK: engine}. Returns "1-0", "0-1" or "1/2-1/2".
+    settings (optional) = {color: {"ponder": bool, "overhead": seconds}}: the side ponders on the opponent's time,
+    and is told its clock is this much shorter than it is, as lichess-bot's move_overhead does."""
+    settings = settings or {}
     base, inc = tc
     board = chess.Board()
     for uci in opening.split():
@@ -43,10 +46,14 @@ def play(engines, opening, tc):
     lopsided = 0
     while not board.is_game_over(claim_draw=True):
         side = board.turn
-        limit = chess.engine.Limit(white_clock=clock[chess.WHITE], black_clock=clock[chess.BLACK],
+        cfg = settings.get(side, {})
+        shown = dict(clock)
+        shown[side] = max(0.001, clock[side] - cfg.get("overhead", 0))
+        limit = chess.engine.Limit(white_clock=shown[chess.WHITE], black_clock=shown[chess.BLACK],
                                    white_inc=inc, black_inc=inc)
         t0 = time.monotonic()
-        result = engines[side].play(board, limit, info=chess.engine.INFO_SCORE, game=game)
+        result = engines[side].play(board, limit, info=chess.engine.INFO_SCORE, game=game,
+                                    ponder=cfg.get("ponder", False))
         clock[side] -= time.monotonic() - t0
         if clock[side] < -0.5 or result.move is None or result.move not in board.legal_moves:
             return "0-1" if side == chess.WHITE else "1-0"  # flag or illegal move loses
@@ -62,9 +69,24 @@ def play(engines, opening, tc):
     return board.result(claim_draw=True)
 
 
-def open_engine(path, book=False):
+def parse_options(text):
+    """"Threads=4 Hash=64 ponder=1 overhead=1000" -> (UCI options, play settings). ponder and overhead (ms) are
+    not UCI options: they set how the side is played (see play())."""
+    uci, settings = {}, {}
+    for item in (text or "").split():
+        k, v = item.split("=", 1)
+        if k.lower() == "ponder":
+            settings["ponder"] = v.lower() in ("1", "true", "yes", "on")
+        elif k.lower() == "overhead":
+            settings["overhead"] = float(v) / 1000
+        else:
+            uci[k] = int(v) if v.lstrip("-").isdigit() else v
+    return uci, settings
+
+
+def open_engine(path, book=False, options=None):
     e = chess.engine.SimpleEngine.popen_uci([os.path.abspath(path), "uci"])
-    e.configure({"OwnBook": book, "Threads": 1})
+    e.configure({"OwnBook": book, "Threads": 1, **(options or {})})
     return e
 
 
@@ -103,7 +125,11 @@ def main():
     ap.add_argument("--book", choices=["none", "cand", "base", "both"], default="none",
                     help="which side plays from its own opening book (book.bin next to the exe); with a book in "
                          "play every game starts from the initial position instead of the opening suite")
+    ap.add_argument("--cand-options", default="", help='e.g. "Threads=4 Hash=64 ponder=1 overhead=1000"')
+    ap.add_argument("--base-options", default="")
     args = ap.parse_args()
+    cand_uci, cand_play = parse_options(args.cand_options)
+    base_uci, base_play = parse_options(args.base_options)
     tc = tuple(float(x) for x in args.tc.split("+"))
     if args.book == "none":
         openings = [l.strip() for l in open(args.openings) if l.strip()]
@@ -122,13 +148,14 @@ def main():
         if done.is_set():
             return
         if not hasattr(local, "cand"):
-            local.cand = open_engine(args.candidate, args.book in ("cand", "both"))
-            local.base = open_engine(args.base, args.book in ("base", "both"))
+            local.cand = open_engine(args.candidate, args.book in ("cand", "both"), cand_uci)
+            local.base = open_engine(args.base, args.book in ("base", "both"), base_uci)
         opening = openings[(args.offset + i) % len(openings)]
         points = 0.0
         for cand_white in (True, False):
             w, b = (local.cand, local.base) if cand_white else (local.base, local.cand)
-            res = play({chess.WHITE: w, chess.BLACK: b}, opening, tc)
+            cw, cb = (cand_play, base_play) if cand_white else (base_play, cand_play)
+            res = play({chess.WHITE: w, chess.BLACK: b}, opening, tc, {chess.WHITE: cw, chess.BLACK: cb})
             pts = 0.5 if res == "1/2-1/2" else float((res == "1-0") == cand_white)
             points += pts
             with lock:
