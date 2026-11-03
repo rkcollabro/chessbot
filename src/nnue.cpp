@@ -42,6 +42,7 @@ struct Net {
 };
 
 Net g_net;
+unsigned g_netGen = 1;  // bumped on every load, so rebuild caches built from older weights are discarded
 bool g_loaded = false;
 bool g_enabled = true;
 
@@ -100,6 +101,7 @@ bool load(const std::string& path) {
              std::fread(g_net.outBias, 4, buckets, f) == size_t(buckets);
     }
     std::fclose(f);
+    g_netGen++;  // rebuild caches hold sums from the old weights
     g_loaded = ok;
     return ok;
 }
@@ -110,43 +112,70 @@ bool active() { return g_loaded && g_enabled; }
 
 namespace {
 
-void refresh(const Board& b, NnueAccum& a) {
-    for (int p = 0; p < 2; p++)
-        for (int i = 0; i < HIDDEN; i++) a.v[p][i] = g_net.ftBias[i];
-    const KingView kv[2] = {kingView(WHITE, b.kingSq[WHITE]), kingView(BLACK, b.kingSq[BLACK])};
-    for (Bitboard occ = b.occAll; occ;) {
-        int s = popLsb(occ);
-        int piece = b.sq[s];
-        for (int p = 0; p < 2; p++) {
-            const int16_t* w = &g_net.ftWeights[size_t(feature(p, kv[p], piece, s)) * HIDDEN];
-            for (int i = 0; i < HIDDEN; i++) a.v[p][i] += w[i];
-        }
-    }
-    a.computed = true;
+// Rebuild cache, one per thread: for each side and king view, the sums of the last position rebuilt with that
+// view and the pieces it had. A rebuild starts from there and only applies the pieces that differ, which is
+// usually a handful instead of every piece on the board.
+struct CacheEntry {
+    alignas(64) int16_t v[HIDDEN];
+    Bitboard pieces[2][7];
+    unsigned gen = 0;  // network the entry was built with (0 = empty)
+};
+thread_local CacheEntry t_cache[2][MAX_KBUCKETS * 2];
+
+inline void addWeights(int16_t* acc, const int16_t* w, int sign) {
+    if (sign > 0)
+        for (int i = 0; i < HIDDEN; i++) acc[i] += w[i];
+    else
+        for (int i = 0; i < HIDDEN; i++) acc[i] -= w[i];
 }
 
-// Whether a's move took a king into a different bucket or mirror half, which changes every input of that side:
-// such a position is rebuilt from the board instead of updated.
-bool kingViewChanged(const NnueAccum& a) {
-    if (g_net.kbuckets == 1 && !g_net.mirror) return false;
-    for (int d = 0; d < a.ndirty; d++) {
-        if ((a.dirtyPiece[d] & 7) != KING || a.dirtySign[d] > 0) continue;
-        for (int e = 0; e < a.ndirty; e++)
-            if (a.dirtyPiece[e] == a.dirtyPiece[d] && a.dirtySign[e] > 0) {
-                int c = a.dirtyPiece[d] >> 3;  // a king move only changes its own side's view
-                if (kingView(c, a.dirtySq[d]) != kingView(c, a.dirtySq[e])) return true;
+// Rebuilds perspective p's sums from the board.
+void refresh(const Board& b, NnueAccum& a, int p) {
+    const KingView kv = kingView(p, b.kingSq[p]);
+    CacheEntry& e = t_cache[p][kv.base / INPUTS * 2 + (kv.flip ? 1 : 0)];
+    if (e.gen != g_netGen) {
+        for (int i = 0; i < HIDDEN; i++) e.v[i] = g_net.ftBias[i];
+        std::memset(e.pieces, 0, sizeof(e.pieces));
+        e.gen = g_netGen;
+    }
+    for (int c = 0; c < 2; c++)
+        for (int t = PAWN; t <= KING; t++) {
+            const int piece = (c << 3) | t;
+            for (Bitboard add = b.pieces[c][t] & ~e.pieces[c][t]; add;) {
+                int s = popLsb(add);
+                addWeights(e.v, &g_net.ftWeights[size_t(feature(p, kv, piece, s)) * HIDDEN], 1);
             }
+            for (Bitboard rem = e.pieces[c][t] & ~b.pieces[c][t]; rem;) {
+                int s = popLsb(rem);
+                addWeights(e.v, &g_net.ftWeights[size_t(feature(p, kv, piece, s)) * HIDDEN], -1);
+            }
+            e.pieces[c][t] = b.pieces[c][t];
+        }
+    std::memcpy(a.v[p], e.v, sizeof(e.v));
+    a.computed[p] = true;
+}
+
+// Whether a's move took perspective p's own king into a different bucket or mirror half, which changes every
+// input of that side: p's sums are then rebuilt from the board instead of updated. The other side's are not.
+bool kingViewChanged(const NnueAccum& a, int p) {
+    if (g_net.kbuckets == 1 && !g_net.mirror) return false;
+    const int king = (p << 3) | KING;
+    for (int d = 0; d < a.ndirty; d++) {
+        if (a.dirtyPiece[d] != king || a.dirtySign[d] > 0) continue;
+        for (int e = 0; e < a.ndirty; e++)
+            if (a.dirtyPiece[e] == king && a.dirtySign[e] > 0 && kingView(p, a.dirtySq[d]) != kingView(p, a.dirtySq[e]))
+                return true;
     }
     return false;
 }
 
-// a = parent plus the pieces a's move added, minus the ones it removed, done in one pass over the sums. kv is
-// each side's king view, the same for parent and a (moves that change it are rebuilt instead).
-void update(const NnueAccum& parent, NnueAccum& a, const KingView* kv) {
+// Perspective p of a = parent plus the pieces a's move added, minus the ones it removed, in one pass over the
+// sums. kv is p's king view, the same for parent and a (moves that change it are rebuilt instead).
+void update(const NnueAccum& parent, NnueAccum& a, int p, const KingView& kv) {
     const int16_t* w[4];
-    for (int p = 0; p < 2; p++) {
+    {
         for (int d = 0; d < a.ndirty; d++)
-            w[d] = &g_net.ftWeights[size_t(feature(p, kv[p], a.dirtyPiece[d], a.dirtySq[d])) * HIDDEN];
+            w[d] = &g_net.ftWeights[size_t(feature(p, kv, a.dirtyPiece[d], a.dirtySq[d])) * HIDDEN];
         const int16_t* src = parent.v[p];
         int16_t* dst = a.v[p];
 #if defined(NNUE_AVX2)
@@ -175,7 +204,7 @@ void update(const NnueAccum& parent, NnueAccum& a, const KingView* kv) {
         }
 #endif
     }
-    a.computed = true;
+    a.computed[p] = true;
 }
 
 // Sum of clamp(acc, 0, QA) * weight over the hidden units.
@@ -214,21 +243,32 @@ int evaluate(const Board& b) {
     static_assert(NNUE_HIDDEN == HIDDEN, "accumulator size");
     std::vector<NnueAccum>& st = b.nnueStack;
     const int top = int(b.undoStack.size());
-    // Walk back to the nearest position whose sums are known; a long walk costs more than a rebuild.
-    int k = top;
-    while (k > 0 && !st[k].computed && !st[k].refresh && !kingViewChanged(st[k]) && top - k < 16) k--;
-    if (st[k].computed) {
-        // No move after k changed a king view, so every position on the way shares the current one.
-        const KingView kv[2] = {kingView(WHITE, b.kingSq[WHITE]), kingView(BLACK, b.kingSq[BLACK])};
-        for (int j = k + 1; j <= top; j++) update(st[j - 1], st[j], kv);
-    } else {
-        refresh(b, st[top]);
+    // Each side separately: walk back to the nearest position whose sums are known, then update forward; a long
+    // walk costs more than a rebuild. A king move into another bucket only forces a rebuild of its own side.
+    for (int p = 0; p < 2; p++) {
+        if (st[top].computed[p]) continue;
+        int k = top;
+        while (k > 0 && !st[k].computed[p] && !st[k].refresh && !kingViewChanged(st[k], p) && top - k < 16) k--;
+        if (st[k].computed[p]) {
+            // No move after k changed p's king view, so every position on the way shares the current one.
+            const KingView kv = kingView(p, b.kingSq[p]);
+            for (int j = k + 1; j <= top; j++) update(st[j - 1], st[j], p, kv);
+        } else {
+            refresh(b, st[top], p);
+        }
     }
     const NnueAccum& a = st[top];
 #ifdef NNUE_VERIFY  // debug builds: the incremental sums must equal a rebuild from the board
     {
-        static thread_local NnueAccum fresh;
-        refresh(b, fresh);
+        static thread_local NnueAccum fresh;  // summed from scratch, without the rebuild cache
+        for (int p = 0; p < 2; p++) {
+            const KingView kv = kingView(p, b.kingSq[p]);
+            for (int i = 0; i < HIDDEN; i++) fresh.v[p][i] = g_net.ftBias[i];
+            for (Bitboard occ = b.occAll; occ;) {
+                int s = popLsb(occ);
+                addWeights(fresh.v[p], &g_net.ftWeights[size_t(feature(p, kv, b.sq[s], s)) * HIDDEN], 1);
+            }
+        }
         if (std::memcmp(fresh.v, a.v, sizeof(a.v)) != 0) {
             std::fprintf(stderr, "NNUE accumulator mismatch at ply %d\n", top);
             std::abort();

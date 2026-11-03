@@ -127,7 +127,7 @@ struct Undo {
 constexpr int NNUE_HIDDEN = NNUE_HIDDEN_SIZE;
 struct NnueAccum {
     alignas(64) int16_t v[2][NNUE_HIDDEN];  // [perspective]
-    bool computed = false;
+    bool computed[2] = {false, false};  // per perspective
     bool refresh = true;  // no usable parent: rebuild from the board
     int ndirty = 0;
     int8_t dirtyPiece[4], dirtySq[4], dirtySign[4];

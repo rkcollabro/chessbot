@@ -322,7 +322,7 @@ void Board::clear() {
     undoStack.clear();
     hashHistory.clear();
     nnueStack.resize(1);
-    nnueStack[0].computed = false;
+    nnueStack[0].computed[0] = nnueStack[0].computed[1] = false;
     nnueStack[0].refresh = true;
 }
 
@@ -330,7 +330,7 @@ NnueAccum& Board::pushAccum() {
     size_t i = undoStack.size();
     if (nnueStack.size() <= i) nnueStack.resize(i + 1);
     NnueAccum& a = nnueStack[i];
-    a.computed = false;
+    a.computed[0] = a.computed[1] = false;
     a.refresh = false;
     a.ndirty = 0;
     return a;
@@ -355,7 +355,7 @@ inline void Board::removePiece(int s) {
 
 void Board::put(int s, int piece) {
     checkCache = -1;
-    nnueStack[undoStack.size()].computed = false;
+    nnueStack[undoStack.size()].computed[0] = nnueStack[undoStack.size()].computed[1] = false;
     nnueStack[undoStack.size()].refresh = true;
     if (sq[s]) {
         removePiece(s);
