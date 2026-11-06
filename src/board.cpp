@@ -729,6 +729,16 @@ void Board::castleSquares(Move m, int& kingTo, int& rookFrom, int& rookTo) const
     rookTo = base + (kingSide ? 5 : 3);
 }
 
+uint64_t Board::keyAfterApprox(Move m) const {
+    if (isDrop(m)) return hash ^ Z_side;
+    const int from = moveFrom(m), to = moveTo(m), p = sq[from];
+    const int np = movePromo(m) ? makePiece(stm, movePromo(m)) : p;
+    uint64_t k = hash ^ Z_side ^ Z_piece[p][from] ^ Z_piece[np][to];
+    if (sq[to] && !(moveFlags(m) & MF_CASTLE)) k ^= Z_piece[sq[to]][to];
+    if (ep >= 0) k ^= Z_ep[fileOf(ep)];
+    return k;
+}
+
 bool Board::makeMove(Move m) {
     const int from = moveFrom(m), to = moveTo(m);
     const uint32_t flags = moveFlags(m);

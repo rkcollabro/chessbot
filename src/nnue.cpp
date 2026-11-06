@@ -103,13 +103,34 @@ void update(const NnueAccum& parent, NnueAccum& a) {
         const int16_t* src = parent.v[p];
         int16_t* dst = a.v[p];
 #if defined(NNUE_AVX2)
-        for (int i = 0; i < HIDDEN; i += 16) {
-            __m256i x = _mm256_loadu_si256((const __m256i*)(src + i));
-            for (int d = 0; d < a.ndirty; d++) {
-                __m256i y = _mm256_loadu_si256((const __m256i*)(w[d] + i));
-                x = a.dirtySign[d] > 0 ? _mm256_add_epi16(x, y) : _mm256_sub_epi16(x, y);
+        // The common shapes get loops without per-lane sign tests: a quiet move (one added, one removed), a
+        // capture (one added, two removed) and castling (two and two). int16 sums wrap the same in any order,
+        // so the result is bit-identical to the general loop below.
+        const int16_t *add[4], *sub[4];
+        int na = 0, ns = 0;
+        for (int d = 0; d < a.ndirty; d++) (a.dirtySign[d] > 0 ? add[na++] : sub[ns++]) = w[d];
+        auto ld = [](const int16_t* q) { return _mm256_loadu_si256((const __m256i*)q); };
+        if (na == 1 && ns == 1) {
+            for (int i = 0; i < HIDDEN; i += 16)
+                _mm256_storeu_si256((__m256i*)(dst + i),
+                                    _mm256_sub_epi16(_mm256_add_epi16(ld(src + i), ld(add[0] + i)), ld(sub[0] + i)));
+        } else if (na == 1 && ns == 2) {
+            for (int i = 0; i < HIDDEN; i += 16)
+                _mm256_storeu_si256((__m256i*)(dst + i),
+                                    _mm256_sub_epi16(_mm256_sub_epi16(_mm256_add_epi16(ld(src + i), ld(add[0] + i)),
+                                                                      ld(sub[0] + i)), ld(sub[1] + i)));
+        } else if (na == 2 && ns == 2) {
+            for (int i = 0; i < HIDDEN; i += 16) {
+                __m256i x = _mm256_add_epi16(_mm256_add_epi16(ld(src + i), ld(add[0] + i)), ld(add[1] + i));
+                _mm256_storeu_si256((__m256i*)(dst + i), _mm256_sub_epi16(_mm256_sub_epi16(x, ld(sub[0] + i)), ld(sub[1] + i)));
             }
-            _mm256_storeu_si256((__m256i*)(dst + i), x);
+        } else {
+            for (int i = 0; i < HIDDEN; i += 16) {
+                __m256i x = ld(src + i);
+                for (int d = 0; d < na; d++) x = _mm256_add_epi16(x, ld(add[d] + i));
+                for (int d = 0; d < ns; d++) x = _mm256_sub_epi16(x, ld(sub[d] + i));
+                _mm256_storeu_si256((__m256i*)(dst + i), x);
+            }
         }
 #elif defined(NNUE_SSE2)
         for (int i = 0; i < HIDDEN; i += 8) {

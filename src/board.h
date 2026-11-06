@@ -191,6 +191,9 @@ public:
 
     // Returns false (and leaves the board unchanged) if the move leaves the king in check.
     bool makeMove(Move m);
+    // The hash after m, for prefetching the TT entry early. Exact for ordinary moves and captures; castling,
+    // en passant targets and rights changes are ignored (a wrong guess only prefetches a useless line).
+    uint64_t keyAfterApprox(Move m) const;
     void unmakeMove();
     void makeNull();
     void unmakeNull();
