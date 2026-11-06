@@ -117,6 +117,10 @@ def main():
     ap.add_argument("--qb", type=int, default=QB, help="output-layer quantization in the exported file (64 = original)")
     ap.add_argument("--init", help="start from this .pt state dict (same --hidden) instead of random weights; "
                                    "a single-output network's output is copied into every bucket")
+    ap.add_argument("--optimizer", choices=["adam", "adamw"], default="adam")
+    ap.add_argument("--wd", type=float, default=0.01, help="AdamW weight decay")
+    ap.add_argument("--final-lr", type=float, default=0.0,
+                    help="learning rate the cosine schedule ends at, as a fraction of --lr (0 = decays to 0)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--seed", type=int, default=1)
     args = ap.parse_args()
@@ -146,8 +150,18 @@ def main():
                 state[k] = state[k].repeat(BUCKETS, *([1] * (state[k].dim() - 1)))
         net.load_state_dict(state)
         print(f"initialised from {args.init}", flush=True)
-    opt = torch.optim.Adam(net.parameters(), lr=args.lr)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
+    if args.optimizer == "adamw":
+        opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.wd)
+    else:
+        opt = torch.optim.Adam(net.parameters(), lr=args.lr)
+    # Stepped per batch, so the rate falls smoothly within each epoch, not in ten steps.
+    steps = args.epochs * math.ceil(sum(e - s for _, s, e in chunks) / args.batch)
+    if args.final_lr > 0:
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, steps, eta_min=args.lr * args.final_lr)
+        per_batch = True
+    else:
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
+        per_batch = False
 
     for epoch in range(args.epochs):
         t0 = time.time()
@@ -164,11 +178,14 @@ def main():
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
+                if per_batch:
+                    sched.step()
                 with torch.no_grad():
                     net.ft.weight[PAD].zero_()
                 loss_sum += loss.item() * len(target)
                 seen += len(target)
-        sched.step()
+        if not per_batch:
+            sched.step()
         with torch.no_grad():
             n = len(val[3])
             vl = [torch.sum((torch.sigmoid(net(*(v[i:i + 65536] for v in val[:3]))) - val[3][i:i + 65536]) ** 2)
