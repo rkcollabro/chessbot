@@ -50,8 +50,20 @@ struct Magic {
 Magic ROOK_MAGIC[64], BISHOP_MAGIC[64];
 Bitboard ROOK_TABLE[102400], BISHOP_TABLE[5248];
 
+// With BMI2, PEXT gathers the mask's blocker bits straight into a dense index: one instruction replacing the
+// multiply and shift, and the table needs no magic numbers. (MSVC has no __BMI2__ macro; every AVX2 CPU has
+// BMI2.) Note: PEXT is slow on AMD before Zen 3, so a build for such a machine should use NO_PEXT.
+#if (defined(__BMI2__) || (defined(_MSC_VER) && defined(__AVX2__))) && !defined(NO_PEXT)
+#define USE_PEXT 1
+#include <immintrin.h>
+#endif
+
 inline Bitboard magicLookup(const Magic& m, Bitboard occ) {
+#ifdef USE_PEXT
+    return m.table[_pext_u64(occ, m.mask)];
+#else
     return m.table[((occ & m.mask) * m.magic) >> m.shift];
+#endif
 }
 Bitboard bishop(int s, Bitboard occ) { return magicLookup(BISHOP_MAGIC[s], occ); }
 Bitboard rook(int s, Bitboard occ) { return magicLookup(ROOK_MAGIC[s], occ); }
@@ -139,6 +151,12 @@ void initMagics(Magic* magics, Bitboard* table, const int* dirs, Bitboard (*slow
             refs[i] = slow(s, sub);
             sub = (sub - m.mask) & m.mask;
         }
+#ifdef USE_PEXT
+        for (int i = 0; i < n; i++) next[_pext_u64(occs[i], m.mask)] = refs[i];
+        m.magic = known[s];
+        next += n;
+        continue;
+#endif
         for (bool first = true;; first = false) {
             m.magic = first ? known[s] : splitmix(seed) & splitmix(seed) & splitmix(seed);  // sparse candidates work best
             if (!first && popcount((m.mask * m.magic) >> 56) < 6) continue;
