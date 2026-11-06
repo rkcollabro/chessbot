@@ -36,7 +36,9 @@ struct TTEntry {
 struct TTData {
     Move move;
     int score, depth, flag;
+    int eval;  // the position's raw static eval, or NO_EVAL if the entry has none
 };
+constexpr int NO_EVAL = -32768;
 
 // The size is a power of two (the UCI "Hash" option rounds down to one); TT_DEFAULT_MB until set. Tests
 // change the default at build time (-DTT_DEFAULT_MB=...) to compare table sizes without UCI options.
@@ -49,9 +51,16 @@ bool g_ttLarge = false;
 // All-zero bytes are an empty entry, which is what allocLargePages hands back.
 TTEntry* g_tt = static_cast<TTEntry*>(allocLargePages(g_ttSize * sizeof(TTEntry), g_ttLarge));
 
-inline uint64_t ttPack(Move m, int score, int depth, int flag) {
+// Bits: move 0-19, score 20-35, depth 36-43, flag 44-45, raw static eval 46-61 (stored inverted, so the
+// all-zero bits of an entry written without one read back as "none").
+inline uint64_t ttPack(Move m, int score, int depth, int flag, int eval) {
+    const uint64_t ev = eval == NO_EVAL ? 0 : uint64_t(uint16_t(std::max(-32767, std::min(32767, eval)) + 32768) ^ 0xFFFF);
     return uint64_t(m & 0xFFFFF) | (uint64_t(uint16_t(score + 32768)) << 20) | (uint64_t(depth & 0xFF) << 36) |
-           (uint64_t(flag) << 44);
+           (uint64_t(flag) << 44) | (ev << 46);
+}
+inline int ttEval(uint64_t data) {
+    const uint64_t ev = (data >> 46) & 0xFFFF;
+    return ev == 0 ? NO_EVAL : int(ev ^ 0xFFFF) - 32768;
 }
 
 // Start pulling a position's entry into cache as soon as its key is known, so the probe that
@@ -72,18 +81,20 @@ bool ttProbe(uint64_t key, TTData& d) {
     d.score = int((data >> 20) & 0xFFFF) - 32768;
     d.depth = int((data >> 36) & 0xFF);
     d.flag = int((data >> 44) & 3);
+    d.eval = ttEval(data);
     return true;
 }
 
-void ttStore(uint64_t key, Move m, int score, int depth, int flag) {
+void ttStore(uint64_t key, Move m, int score, int depth, int flag, int eval = NO_EVAL) {
     TTEntry& e = g_tt[key & g_ttMask];
     uint64_t old = e.data.load(std::memory_order_relaxed);
     bool same = (e.keyXor.load(std::memory_order_relaxed) ^ old) == key;
     if (same) {
         if (int((old >> 36) & 0xFF) > depth + 2 && flag != TT_EXACT) return;  // keep deeper results
         if (!m) m = Move(old & 0xFFFFF);                                          // keep the known best move
+        if (eval == NO_EVAL) eval = ttEval(old);                                  // and the known static eval
     }
-    uint64_t data = ttPack(m, score, std::max(0, depth), flag);
+    uint64_t data = ttPack(m, score, std::max(0, depth), flag, eval);
     e.data.store(data, std::memory_order_relaxed);
     e.keyXor.store(key ^ data, std::memory_order_relaxed);
 }
@@ -580,6 +591,7 @@ public:
         if (b.variant == ANTICHESS) return qsearchAntichess(alpha, beta, ply);
 
         TTData tt;
+        tt.eval = NO_EVAL;
         Move ttMove = NO_MOVE;
         if (ttProbe(b.hash, tt)) {
             int s = scoreFromTT(tt.score, ply);
@@ -589,10 +601,11 @@ public:
         }
 
         bool inCheck = b.inCheck();
-        int best = -INF;
+        int best = -INF, raw = NO_EVAL;
         const int origAlpha = alpha;
         if (!inCheck) {
-            best = corrected(eval());
+            raw = tt.eval != NO_EVAL ? tt.eval : eval();  // the network's verdict on this position, cached in the TT
+            best = corrected(raw);
             if (best >= beta) return best;
             if (best > alpha) alpha = best;
         }
@@ -639,7 +652,7 @@ public:
         }
         if (inCheck && !legal) return -MATE + ply;
         int flag = best >= beta ? TT_LOWER : (best > origAlpha ? TT_EXACT : TT_UPPER);
-        ttStore(b.hash, bestMove, scoreToTT(best, ply), 0, flag);
+        ttStore(b.hash, bestMove, scoreToTT(best, ply), 0, flag, raw);
         return best;
     }
 
@@ -685,7 +698,7 @@ public:
             staticEval = evalStack[ply];  // same position, already evaluated
             rawEval = rawEvalStack[ply];
         } else {
-            rawEval = eval();
+            rawEval = ttHit && tt.eval != NO_EVAL ? tt.eval : eval();
             staticEval = corrected(rawEval);
         }
         evalStack[ply] = staticEval;
@@ -876,7 +889,7 @@ public:
 
         if (!excludedMove) {
             int flag = best >= beta ? TT_LOWER : (best > origAlpha ? TT_EXACT : TT_UPPER);
-            ttStore(b.hash, bestMove, scoreToTT(best, ply), depth, flag);
+            ttStore(b.hash, bestMove, scoreToTT(best, ply), depth, flag, inCheck ? NO_EVAL : rawEval);
             // Learn from the result only when it says something about the eval: a quiet best move (a capture's
             // gain is material the eval could not see coming), a non-mate score, and a bound on the
             // informative side (a fail-high below the eval, or a fail-low above it, gives no direction).
