@@ -79,14 +79,20 @@ def parse_options(text):
             settings["ponder"] = v.lower() in ("1", "true", "yes", "on")
         elif k.lower() == "overhead":
             settings["overhead"] = float(v) / 1000
+        elif v.lower() in ("true", "false"):
+            uci[k] = v.lower() == "true"
         else:
             uci[k] = int(v) if v.lstrip("-").isdigit() else v
     return uci, settings
 
 
 def open_engine(path, book=False, options=None):
-    e = chess.engine.SimpleEngine.popen_uci([os.path.abspath(path), "uci"])
-    e.configure({"OwnBook": book, "Threads": 1, **(options or {})})
+    # chesscli needs its "uci" subcommand; other engines (e.g. Stockfish, recognised by name) speak UCI directly
+    # and would treat a "uci" argument as a command to run and then exit.
+    cmd = [os.path.abspath(path)] if "stockfish" in os.path.basename(path).lower() else [os.path.abspath(path), "uci"]
+    e = chess.engine.SimpleEngine.popen_uci(cmd)
+    wanted = {"OwnBook": book, "Threads": 1, **(options or {})}
+    e.configure({k: v for k, v in wanted.items() if k in e.options})  # only options this engine has
     return e
 
 

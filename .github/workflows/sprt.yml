@@ -112,8 +112,18 @@ jobs:
         run: |
           for side in cand base; do
             if [ $side = cand ]; then ref=$CAND_REF; flags=$CAND_FLAGS; else ref=$BASE_REF; flags=$BASE_FLAGS; fi
-            git worktree add "/tmp/$side" "origin/$ref" 2>/dev/null || git worktree add "/tmp/$side" "$ref"
             mkdir -p "eng/$side"
+            case $ref in stockfish:*)
+              # An official Stockfish release as the opponent, e.g. "stockfish:17.1" (limit it with base_options
+              # such as "UCI_LimitStrength=true UCI_Elo=2800").
+              curl -sSfL -o /tmp/sf.tar "https://github.com/official-stockfish/Stockfish/releases/download/sf_${ref#stockfish:}/stockfish-ubuntu-x86-64-avx2.tar"
+              mkdir -p /tmp/sf && tar -xf /tmp/sf.tar -C /tmp/sf
+              cp "$(find /tmp/sf -type f -name 'stockfish-ubuntu-x86-64-avx2' | head -1)" "eng/$side/stockfish"
+              chmod +x "eng/$side/stockfish"
+              echo "uci" | "eng/$side/stockfish" | grep -m1 "^id name"
+              continue;;
+            esac
+            git worktree add "/tmp/$side" "origin/$ref" 2>/dev/null || git worktree add "/tmp/$side" "$ref"
             sh tools/ci_build.sh "/tmp/$side/src" "eng/$side/chesscli" $flags
             [ -f "/tmp/$side/nnue.bin" ] && cp "/tmp/$side/nnue.bin" "eng/$side/"
             [ -f "/tmp/$side/book.bin" ] && cp "/tmp/$side/book.bin" "eng/$side/"
@@ -129,7 +139,8 @@ jobs:
         run: |
           # Every round and shard starts at its own opening, so later rounds move on through the book.
           offset=$(( ((ROUND - 1) * JOBS * PAIRS + ${{ matrix.shard }} * PAIRS) % 3000 ))
-          python3 tools/sprt.py eng/cand/chesscli eng/base/chesscli --fixed "$PAIRS" --offset "$offset" \
+          bin() { if [ -f "eng/$1/stockfish" ]; then echo "eng/$1/stockfish"; else echo "eng/$1/chesscli"; fi; }
+          python3 tools/sprt.py "$(bin cand)" "$(bin base)" --fixed "$PAIRS" --offset "$offset" \
             --tc "$TC" --concurrency "$CONC" --book "${{ inputs.book || 'none' }}" --json "result-${{ matrix.shard }}.json"             --cand-options "$CAND_OPTS" --base-options "$BASE_OPTS"
       - uses: actions/upload-artifact@v4
         with:
