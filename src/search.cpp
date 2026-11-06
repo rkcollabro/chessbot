@@ -712,7 +712,9 @@ public:
             }
             // Null-move pruning.
             // (Not in antichess: zugzwang is the whole game there.)
-            if (nullOk && depth >= 3 && staticEval >= beta && b.hasNonPawnMaterial(b.stm) && b.variant != ANTICHESS) {
+            // Skipped when the TT already says this position fails low: the null move would only confirm it.
+            if (nullOk && depth >= 3 && staticEval >= beta && b.hasNonPawnMaterial(b.stm) && b.variant != ANTICHESS &&
+                !(ttHit && tt.flag == TT_UPPER && ttScore < beta)) {
                 int R = 3 + depth / 4 + std::min(3, (staticEval - beta) / P_NMP_EVAL);
                 moveStack[ply] = NO_MOVE;
                 b.makeNull();
