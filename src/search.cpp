@@ -49,25 +49,36 @@ bool g_ttLarge = false;
 // All-zero bytes are an empty entry, which is what allocLargePages hands back.
 TTEntry* g_tt = static_cast<TTEntry*>(allocLargePages(g_ttSize * sizeof(TTEntry), g_ttLarge));
 
+// Entries come in buckets of four (one 64-byte cache line): a probe looks at all four for the key, a store
+// replaces the least valuable one - empty first, else the shallowest, with entries from earlier searches
+// counting as 8 plies shallower per search of age. The search generation (6 bits) lives in bits 46-51.
+constexpr int TT_BUCKET = 4;
+unsigned g_ttGen = 0;
+
 inline uint64_t ttPack(Move m, int score, int depth, int flag) {
     return uint64_t(m & 0xFFFFF) | (uint64_t(uint16_t(score + 32768)) << 20) | (uint64_t(depth & 0xFF) << 36) |
-           (uint64_t(flag) << 44);
+           (uint64_t(flag) << 44) | (uint64_t(g_ttGen & 63) << 46);
 }
+inline TTEntry* ttBucket(uint64_t key) { return &g_tt[key & g_ttMask & ~size_t(TT_BUCKET - 1)]; }
 
 // Start pulling a position's entry into cache as soon as its key is known, so the probe that
 // follows a few hundred instructions later doesn't stall on main memory.
 inline void ttPrefetch(uint64_t key) {
 #ifdef _MSC_VER
-    _mm_prefetch((const char*)&g_tt[key & g_ttMask], _MM_HINT_T0);
+    _mm_prefetch((const char*)ttBucket(key), _MM_HINT_T0);
 #else
-    __builtin_prefetch(&g_tt[key & g_ttMask]);
+    __builtin_prefetch(ttBucket(key));
 #endif
 }
 
 bool ttProbe(uint64_t key, TTData& d) {
-    TTEntry& e = g_tt[key & g_ttMask];
-    uint64_t data = e.data.load(std::memory_order_relaxed);
-    if ((e.keyXor.load(std::memory_order_relaxed) ^ data) != key || !data) return false;
+    TTEntry* bucket = ttBucket(key);
+    uint64_t data = 0;
+    for (int i = 0; i < TT_BUCKET && !data; i++) {
+        uint64_t x = bucket[i].data.load(std::memory_order_relaxed);
+        if (x && (bucket[i].keyXor.load(std::memory_order_relaxed) ^ x) == key) data = x;
+    }
+    if (!data) return false;
     d.move = Move(data & 0xFFFFF);
     d.score = int((data >> 20) & 0xFFFF) - 32768;
     d.depth = int((data >> 36) & 0xFF);
@@ -76,9 +87,22 @@ bool ttProbe(uint64_t key, TTData& d) {
 }
 
 void ttStore(uint64_t key, Move m, int score, int depth, int flag) {
-    TTEntry& e = g_tt[key & g_ttMask];
-    uint64_t old = e.data.load(std::memory_order_relaxed);
-    bool same = (e.keyXor.load(std::memory_order_relaxed) ^ old) == key;
+    TTEntry* bucket = ttBucket(key);
+    TTEntry* slot = nullptr;
+    uint64_t old = 0;
+    bool same = false;
+    int worst = 1 << 30;
+    for (int i = 0; i < TT_BUCKET; i++) {
+        uint64_t x = bucket[i].data.load(std::memory_order_relaxed);
+        if (x && (bucket[i].keyXor.load(std::memory_order_relaxed) ^ x) == key) {
+            slot = &bucket[i], old = x, same = true;
+            break;
+        }
+        const int age = int((g_ttGen - unsigned(x >> 46)) & 63);
+        const int value = x ? int((x >> 36) & 0xFF) - 8 * age : -(1 << 20);  // empty slots go first
+        if (value < worst) worst = value, slot = &bucket[i], old = x;
+    }
+    TTEntry& e = *slot;
     if (same) {
         if (int((old >> 36) & 0xFF) > depth + 2 && flag != TT_EXACT) return;  // keep deeper results
         if (!m) m = Move(old & 0xFFFFF);                                          // keep the known best move
@@ -1117,6 +1141,7 @@ Move findBestMove(const Board& root, int timeMs, std::atomic<bool>* stop, const 
         g_pool.back()->id = int(g_pool.size()) - 1;
     }
     Shared shared;
+    g_ttGen++;  // entries from earlier searches age, so they are replaced first
     std::vector<Searcher*> helpers;
     for (int i = 0; i < threads; i++) {
         g_pool[i]->prepare(root, &shared, timeMs, uint64_t(std::max(0, maxNodes)), evalNoise, softMs);
