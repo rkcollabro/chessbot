@@ -116,9 +116,12 @@ jobs:
             case $ref in stockfish:*)
               # An official Stockfish release as the opponent, e.g. "stockfish:17.1" (limit it with base_options
               # such as "UCI_LimitStrength=true UCI_Elo=2800").
-              curl -sSfL -o /tmp/sf.tar "https://github.com/official-stockfish/Stockfish/releases/download/sf_${ref#stockfish:}/stockfish-ubuntu-x86-64-avx2.tar"
+              # Releases up to 17.1 ship stockfish-ubuntu-x86-64-avx2.tar; 18 and later a universal linux build.
+              url=https://github.com/official-stockfish/Stockfish/releases/download/sf_${ref#stockfish:}
+              curl -sSfL -o /tmp/sf.tar "$url/stockfish-linux-x86-64-universal.tar.gz" ||
+                curl -sSfL -o /tmp/sf.tar "$url/stockfish-ubuntu-x86-64-avx2.tar"
               mkdir -p /tmp/sf && tar -xf /tmp/sf.tar -C /tmp/sf
-              cp "$(find /tmp/sf -type f -name 'stockfish-ubuntu-x86-64-avx2' | head -1)" "eng/$side/stockfish"
+              cp "$(find /tmp/sf -type f -name 'stockfish*' ! -name '*.*' -perm -u+x | head -1)" "eng/$side/stockfish"
               chmod +x "eng/$side/stockfish"
               echo "uci" | "eng/$side/stockfish" | grep -m1 "^id name"
               continue;;
