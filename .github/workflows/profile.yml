@@ -1,0 +1,39 @@
+# CPU profile of the bench: where the engine spends its time (perf, by function), for speed work.
+name: Profile
+run-name: Profile ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to profile
+        default: master
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/cache/restore@v4
+        with:
+          path: tb
+          key: tb-v1
+          fail-on-cache-miss: true
+      - name: Install perf
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" || sudo apt-get install -y -qq linux-tools-azure
+          sudo sysctl -w kernel.perf_event_paranoid=-1
+      - name: Build (optimised, with symbols, no PGO)
+        run: |
+          grep -m1 "model name" /proc/cpuinfo
+          g++ -O3 -march=native -std=c++17 -pthread -DNDEBUG -w -g -fno-omit-frame-pointer $(ls src/*.cpp | grep -v gui.cpp) -o chesscli
+      - name: Profile bench
+        run: |
+          perf record -F 2000 -g -o perf.data ./chesscli bench | tail -1
+          echo '## Self time by function' >> "$GITHUB_STEP_SUMMARY"
+          perf report -i perf.data --no-children --sort symbol --stdio 2>/dev/null | grep -E '^ +[0-9]' | head -40 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '## Including callees' >> "$GITHUB_STEP_SUMMARY"
+          perf report -i perf.data --children --sort symbol --stdio 2>/dev/null | grep -E '^ +[0-9]' | head -30 | tee -a "$GITHUB_STEP_SUMMARY"
