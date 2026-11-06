@@ -355,7 +355,11 @@ public:
     // Move ordering memory, kept between moves of a game (per thread).
     Move killers[MAX_PLY][2];
     Move counterMoves[16][64];  // [previous moved piece][previous to-square] -> refutation
-    int history[2][64][64];     // [color][from][to], bounded by gravity to +-16384
+    // [color][from attacked][to attacked][from][to], bounded by gravity to +-16384. "Attacked" = by any enemy
+    // piece, so moving out of (or into) an attack has its own history.
+    int history[2][2][2][64][64];
+    Bitboard threatStack[MAX_PLY];  // squares the opponent attacks at each ply, computed when first needed
+    uint64_t threatKey[MAX_PLY];
     // Continuation history: how a quiet move has fared after a given move 1 and 2 plies earlier.
     int16_t contHist[16][64][16][64];  // [earlier piece][earlier to][piece][to]
     using ContTable = int16_t[16][64];
@@ -486,10 +490,32 @@ public:
         return &contHist[pieceStack[ply - back]][moveTo(moveStack[ply - back])];
     }
 
-    // Combined history of a quiet move: butterfly + continuation 1 and 2 plies back.
+    // Every square the side not to move attacks (pawns, pieces and king), cached per ply.
+    Bitboard threats(int ply) {
+        if (threatKey[ply] == b.hash) return threatStack[ply];
+        const int them = b.stm ^ 1;
+        const Bitboard occ = b.occAll;
+        const Bitboard p = b.pieces[them][PAWN];
+        constexpr Bitboard FILE_A = 0x0101010101010101ULL, FILE_H = FILE_A << 7;
+        Bitboard t = them == WHITE ? ((p & ~FILE_A) << 7) | ((p & ~FILE_H) << 9)
+                                   : ((p & ~FILE_A) >> 9) | ((p & ~FILE_H) >> 7);
+        for (Bitboard x = b.pieces[them][KNIGHT]; x;) t |= attacks::knight(popLsb(x));
+        for (Bitboard x = b.pieces[them][BISHOP] | b.pieces[them][QUEEN]; x;) t |= attacks::bishop(popLsb(x), occ);
+        for (Bitboard x = b.pieces[them][ROOK] | b.pieces[them][QUEEN]; x;) t |= attacks::rook(popLsb(x), occ);
+        for (Bitboard x = b.pieces[them][KING]; x;) t |= attacks::king(popLsb(x));
+        threatKey[ply] = b.hash;
+        return threatStack[ply] = t;
+    }
+    int& mainHist(Move m, int ply) {
+        const int from = moveFrom(m), to = moveTo(m);
+        const Bitboard t = threats(ply);
+        return history[b.stm][isDrop(m) ? 0 : (t >> from) & 1][(t >> to) & 1][isDrop(m) ? to : from][to];
+    }
+
+    // Combined history of a quiet move: butterfly (split by threats) + continuation 1 and 2 plies back.
     int quietStat(Move m, int ply) {
         int p = movingPiece(m), to = moveTo(m);
-        int s = history[b.stm][moveFrom(m)][to];
+        int s = mainHist(m, ply);
         if (ContTable* c = contFor(ply, 1)) s += (*c)[p][to];
         if (ContTable* c = contFor(ply, 2)) s += (*c)[p][to];
         return s;
@@ -503,7 +529,7 @@ public:
 
     void updateQuiet(Move m, int ply, int bonus) {
         int p = movingPiece(m), to = moveTo(m);
-        updateHistory(history[b.stm][moveFrom(m)][to], bonus);
+        updateHistory(mainHist(m, ply), bonus);
         if (ContTable* c = contFor(ply, 1)) updateHist16((*c)[p][to], bonus);
         if (ContTable* c = contFor(ply, 2)) updateHist16((*c)[p][to], bonus);
     }
@@ -955,9 +981,8 @@ public:
         std::memset(killers, 0, sizeof(killers));
         std::memset(excluded, 0, sizeof(excluded));
         std::memset(moveStack, 0, sizeof(moveStack));
-        for (auto& side : history)
-            for (auto& row : side)
-                for (auto& h : row) h /= 2;
+        for (int& h : reinterpret_cast<int(&)[sizeof(history) / sizeof(int)]>(history)) h /= 2;
+        std::memset(threatKey, 0, sizeof(threatKey));
     }
 
     // One aspiration-window iteration. Returns false if the search was stopped.
