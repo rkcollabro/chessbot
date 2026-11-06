@@ -1,0 +1,55 @@
+# Speed comparison: builds two revisions and runs the bench alternately on the same runner (several runners in
+# parallel for more samples). Search signatures show whether the change altered the search itself.
+name: Bench
+run-name: Bench ${{ inputs.candidate }} vs ${{ inputs.base }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: Candidate git ref
+        required: true
+      base:
+        description: Base git ref
+        default: master
+      runs:
+        description: Bench runs per engine per runner
+        default: "5"
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        runner: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/cache/restore@v4
+        with:
+          path: tb
+          key: tb-v1
+          fail-on-cache-miss: true
+      - name: Build
+        run: |
+          grep -m1 "model name" /proc/cpuinfo
+          for side in cand base; do
+            if [ $side = cand ]; then ref=${{ inputs.candidate }}; else ref=${{ inputs.base }}; fi
+            git worktree add "/tmp/$side" "origin/$ref" 2>/dev/null || git worktree add "/tmp/$side" "$ref"
+            mkdir -p "eng/$side"
+            cp "/tmp/$side/nnue.bin" "eng/$side/"
+            ln -s "$PWD/tb" "eng/$side/tb"
+            sh tools/ci_build.sh "/tmp/$side/src" "eng/$side/chesscli"
+          done
+      - name: Bench
+        run: |
+          for i in $(seq 1 ${{ inputs.runs }}); do
+            for side in base cand; do
+              echo "$side $(eng/$side/chesscli bench | tail -1)" | tee -a bench.txt
+            done
+          done
+          for side in base cand; do
+            grep "^$side " bench.txt | sed 's/.*  \([0-9]*\) nodes\/s.*/\1/' | sort -n |
+              awk -v s=$side '{a[NR]=$1} END {print s, "median nps", a[int((NR+1)/2)]}' | tee -a "$GITHUB_STEP_SUMMARY"
+          done
