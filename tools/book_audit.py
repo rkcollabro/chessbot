@@ -116,6 +116,7 @@ def main():
                 json.dump(results, open(args.out, "w"))
     json.dump(results, open(args.out, "w"))
     print("done", flush=True)
+    os._exit(0)  # the engines' reader threads would otherwise keep the process (and the engines) alive
 
 
 if __name__ == "__main__":
