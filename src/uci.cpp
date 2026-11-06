@@ -147,7 +147,7 @@ void uciLoop(const std::string& tbDir, const std::string& bookPath) {
                 int inc = board.stm == WHITE ? winc : binc;
                 if (left < 0) left = 10000;
                 int togo = movestogo > 0 ? std::min(movestogo, 40) : 25;
-                soft = left / togo + inc * 3 / 4;
+                soft = left / togo + inc;
                 ms = std::max(10, std::min(soft * 5, left / 3));
                 soft = std::max(5, std::min(soft, ms));
             }
