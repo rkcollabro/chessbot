@@ -37,3 +37,10 @@ jobs:
           perf report -i perf.data --no-children --sort symbol --stdio 2>/dev/null | grep -E '^ +[0-9]' | head -40 | tee -a "$GITHUB_STEP_SUMMARY"
           echo '## Including callees' >> "$GITHUB_STEP_SUMMARY"
           perf report -i perf.data --children --sort symbol --stdio 2>/dev/null | grep -E '^ +[0-9]' | head -30 | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Hot source lines
+        run: |
+          # Self samples by source line across the binary (srcline sort needs the -g build above).
+          perf report -i perf.data --no-children --sort srcline --stdio 2>/dev/null | grep -E '^ +[0-9]' | head -80
+          echo "--- hottest instructions in negamax"
+          perf annotate -i perf.data --stdio -l "(anonymous namespace)::Searcher::negamax" 2>/dev/null |
+            grep -E '^ +[0-9]+\.[0-9]+' | sort -rn | head -60
