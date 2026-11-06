@@ -9,6 +9,10 @@
 #include <memory>
 #include <thread>
 #include <vector>
+
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #ifdef _MSC_VER
 #include <xmmintrin.h>
 #endif
@@ -531,8 +535,25 @@ public:
         return quietStat(m, ply);
     }
 
+    // Moves the highest-scored remaining move to slot i (the first such move on ties). With AVX2 the maximum
+    // is found 8 scores at a time and then the first slot holding it, which picks exactly the same move.
     static void pickMove(MoveList& ml, int* scores, int i) {
         int best = i;
+#if defined(__AVX2__)
+        const int n = ml.count;
+        if (n - i >= 16) {
+            __m256i mx = _mm256_loadu_si256((const __m256i*)(scores + i));
+            int j = i + 8;
+            for (; j + 8 <= n; j += 8) mx = _mm256_max_epi32(mx, _mm256_loadu_si256((const __m256i*)(scores + j)));
+            __m128i m4 = _mm_max_epi32(_mm256_castsi256_si128(mx), _mm256_extracti128_si256(mx, 1));
+            m4 = _mm_max_epi32(m4, _mm_shuffle_epi32(m4, 0x4E));
+            m4 = _mm_max_epi32(m4, _mm_shuffle_epi32(m4, 0xB1));
+            int top = _mm_cvtsi128_si32(m4);
+            for (; j < n; j++) top = std::max(top, scores[j]);
+            best = i;
+            while (scores[best] != top) best++;
+        } else
+#endif
         for (int j = i + 1; j < ml.count; j++)
             if (scores[j] > scores[best]) best = j;
         std::swap(ml.moves[i], ml.moves[best]);
@@ -765,6 +786,7 @@ public:
         for (int i = 0; i < ml.count; i++) {
             pickMove(ml, scores, i);
             Move m = ml.moves[i];
+            ttPrefetch(b.keyAfterApprox(m));  // start the child's TT fetch before the pruning work below
             if (m == excludedMove) continue;
             const bool quiet = !isCapture(m) && !movePromo(m);
             const int stat = quiet ? quietStat(m, ply) : 0;
