@@ -310,10 +310,25 @@ int antichessEval(const Board& b) {
 
 }  // namespace
 
+// Material scaling of the network's score: the fewer pieces (not pawns) left, the closer to zero. A side that is
+// ahead then prefers keeping pieces on, and one that is behind prefers trading down, which the network alone
+// does not capture well. 1.0 with all pieces on; MS_BASE sets how strongly it fades (larger = weaker).
+#ifndef MS_BASE
+#define MS_BASE 26000
+#endif
+static int materialScale(const Board& b, int score) {
+    const int material = 450 * popcount(b.pieces[WHITE][KNIGHT] | b.pieces[BLACK][KNIGHT]) +
+                         450 * popcount(b.pieces[WHITE][BISHOP] | b.pieces[BLACK][BISHOP]) +
+                         650 * popcount(b.pieces[WHITE][ROOK] | b.pieces[BLACK][ROOK]) +
+                         1250 * popcount(b.pieces[WHITE][QUEEN] | b.pieces[BLACK][QUEEN]);
+    constexpr int FULL = 4 * 450 + 4 * 450 + 4 * 650 + 2 * 1250;
+    return int(int64_t(score) * (MS_BASE + material) / (MS_BASE + FULL));
+}
+
 int evaluate(const Board& b) {
     if (b.variant == ANTICHESS) return fiftyMoveScale(b, antichessEval(b));
     if ((b.variant == STANDARD || b.variant == CHESS960) && nnue::active())
-        return fiftyMoveScale(b, nnue::evaluate(b));
+        return fiftyMoveScale(b, materialScale(b, nnue::evaluate(b)));
     ScoreAcc acc;
     int phase = evalCore(b, acc);
     int score = (acc.mg * phase + acc.eg * (MAX_PHASE - phase)) / MAX_PHASE;
