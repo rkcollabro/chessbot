@@ -190,6 +190,26 @@ constexpr bool F_CONT = SF & 1, F_CAP = SF & 2, F_NPCORR = SF & 4, F_RAZOR = SF 
 #define QS_FUT 139  // qsearch futility margin
 #endif
 
+// Experimental search ideas, each off by default (0 == master's search) so each can be SPRT'd on its own.
+#ifndef E_RFPFIRM
+#define E_RFPFIRM 0  // reverse futility returns (eval + beta) / 2 instead of eval
+#endif
+#ifndef E_IMPROVE
+#define E_IMPROVE 0  // `improving` looks 4 plies back when 2 plies back was in check (instead of always true)
+#endif
+#ifndef E_TTEVAL
+#define E_TTEVAL 0   // pruning eval adjusted by a usable TT bound (RFP, null move, futility)
+#endif
+#ifndef E_CONT4
+#define E_CONT4 0    // continuation history 4 plies back as well
+#endif
+#ifndef E_DEEPER
+#define E_DEEPER 0   // after a reduced search beats alpha, re-search one ply deeper/shallower by margin
+#endif
+#ifndef E_QMALUS
+#define E_QMALUS 0   // a capture cutoff also penalises the quiet moves tried before it
+#endif
+
 // With -DTUNE the parameters become UCI options (for SPSA); otherwise they are compile-time constants.
 #ifdef TUNE
 std::vector<TuneParam>& tuneRegistry() {
@@ -496,6 +516,8 @@ public:
         int s = history[b.stm][moveFrom(m)][to];
         if (ContTable* c = contFor(ply, 1)) s += (*c)[p][to];
         if (ContTable* c = contFor(ply, 2)) s += (*c)[p][to];
+        if (E_CONT4)
+            if (ContTable* c = contFor(ply, 4)) s += (*c)[p][to];
         return s;
     }
 
@@ -510,6 +532,8 @@ public:
         updateHistory(history[b.stm][moveFrom(m)][to], bonus);
         if (ContTable* c = contFor(ply, 1)) updateHist16((*c)[p][to], bonus);
         if (ContTable* c = contFor(ply, 2)) updateHist16((*c)[p][to], bonus);
+        if (E_CONT4)
+            if (ContTable* c = contFor(ply, 4)) updateHist16((*c)[p][to], bonus);
     }
 
     void updateCapture(Move m, int bonus) { updateHist16(capHist[movingPiece(m)][moveTo(m)][capturedType(m)], bonus); }
@@ -711,7 +735,15 @@ public:
         }
         evalStack[ply] = staticEval;
         rawEvalStack[ply] = rawEval;
-        const bool improving = !inCheck && ply >= 2 && staticEval > evalStack[ply - 2];
+        bool improving = !inCheck && ply >= 2 && staticEval > evalStack[ply - 2];
+        if (E_IMPROVE && !inCheck && ply >= 2 && evalStack[ply - 2] == -INF)
+            improving = ply >= 4 && evalStack[ply - 4] != -INF && staticEval > evalStack[ply - 4];
+        // Eval used for pruning decisions: the static eval, or the TT score when its bound says it is more accurate.
+        int pEval = staticEval;
+        if (E_TTEVAL && !inCheck && ttHit && std::abs(ttScore) < MATE_BOUND &&
+            (tt.flag == TT_EXACT || (tt.flag == TT_LOWER && ttScore > staticEval) ||
+             (tt.flag == TT_UPPER && ttScore < staticEval)))
+            pEval = ttScore;
         if (root) doubleExt[0] = 0;
         doubleExt[ply + 1] = doubleExt[ply];
         // Razoring and ProbCut lean on the material-exchange model, so only in standard chess and Chess960.
@@ -722,8 +754,8 @@ public:
 
         if (!pvNode && !inCheck && !excludedMove) {
             // Reverse futility pruning: far above beta at low depth.
-            if (depth <= 6 && std::abs(beta) < MATE_BOUND && staticEval - P_RFP_MARGIN * (depth - improving) >= beta)
-                return staticEval;
+            if (depth <= 6 && std::abs(beta) < MATE_BOUND && pEval - P_RFP_MARGIN * (depth - improving) >= beta)
+                return E_RFPFIRM ? (pEval + beta) / 2 : pEval;
             // Razoring: far below alpha at low depth, check that captures cannot save it.
             if (F_RAZOR && plainChess && depth <= RAZOR_DEPTH && std::abs(alpha) < MATE_BOUND &&
                 staticEval + P_RAZOR_A + P_RAZOR_B * depth * depth <= alpha) {
@@ -733,8 +765,8 @@ public:
             }
             // Null-move pruning.
             // (Not in antichess: zugzwang is the whole game there.)
-            if (nullOk && depth >= 3 && staticEval >= beta && b.hasNonPawnMaterial(b.stm) && b.variant != ANTICHESS) {
-                int R = 3 + depth / 4 + std::min(3, (staticEval - beta) / P_NMP_EVAL);
+            if (nullOk && depth >= 3 && pEval >= beta && b.hasNonPawnMaterial(b.stm) && b.variant != ANTICHESS) {
+                int R = 3 + depth / 4 + std::min(3, (pEval - beta) / P_NMP_EVAL);
                 moveStack[ply] = NO_MOVE;
                 b.makeNull();
                 ttPrefetch(b.hash);
@@ -798,7 +830,7 @@ public:
                     int lmpLimit = (3 + depth * depth) / (improving ? 1 : 2);
                     if (depth <= 7 && nQuiets >= lmpLimit) continue;
                     // Futility pruning: a quiet move cannot lift a hopeless eval to alpha.
-                    if (depth <= 6 && staticEval + P_FUT_BASE + P_FUT_MULT * depth <= alpha) continue;
+                    if (depth <= 6 && pEval + P_FUT_BASE + P_FUT_MULT * depth <= alpha) continue;
                     // History pruning: quiet moves that keep failing here, at low depth.
                     if (F_HISTPRUNE && depth <= HP_DEPTH && scores[i] < 880000 && stat < -P_HP_MULT * depth) continue;
                 }
@@ -853,7 +885,12 @@ public:
                     r = std::max(0, std::min(r, newDepth - 1));
                 }
                 s = -negamax(newDepth - r, -alpha - 1, -alpha, ply + 1, true);
-                if (s > alpha && r > 0) s = -negamax(newDepth, -alpha - 1, -alpha, ply + 1, true);
+                if (s > alpha && r > 0) {
+                    int nd = newDepth;
+                    if (E_DEEPER) nd += (s > best + 40 + 2 * newDepth) - (s < best + newDepth);
+                    s = -negamax(nd, -alpha - 1, -alpha, ply + 1, true);
+                    if (E_DEEPER && nd < newDepth && s > alpha) s = -negamax(newDepth, -alpha - 1, -alpha, ply + 1, true);
+                }
                 if (s > alpha && s < beta) s = -negamax(newDepth, -beta, -alpha, ply + 1, true);
             }
             b.unmakeMove();
@@ -882,6 +919,8 @@ public:
                             if (ply > 0 && moveStack[ply - 1])
                                 counterMoves[pieceStack[ply - 1]][moveTo(moveStack[ply - 1])] = m;
                             for (int k = 0; k < nQuiets; k++) updateQuiet(quiets[k], ply, quiets[k] == m ? bonus : -bonus);
+                        } else if (E_QMALUS) {
+                            for (int k = 0; k < nQuiets; k++) updateQuiet(quiets[k], ply, -bonus);
                         }
                         // The cutoff capture is rewarded; captures tried before it (or before a quiet cutoff) lose.
                         for (int k = 0; k < nCaps; k++) updateCapture(caps[k], caps[k] == m ? bonus : -bonus);
