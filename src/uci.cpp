@@ -141,15 +141,10 @@ void uciLoop(const std::string& tbDir, const std::string& bookPath) {
             } else if (infinite) {
                 ms = 1 << 30;
             } else {
-                // Aim for a share of the remaining clock, and allow up to five times that (but never more
-                // than a third of the clock) when the search is unsettled.
                 int left = board.stm == WHITE ? wtime : btime;
                 int inc = board.stm == WHITE ? winc : binc;
                 if (left < 0) left = 10000;
-                int togo = movestogo > 0 ? std::min(movestogo, 40) : 25;
-                soft = left / togo + inc * 3 / 4;
-                ms = std::max(10, std::min(soft * 5, left / 3));
-                soft = std::max(5, std::min(soft, ms));
+                allocateTime(left, inc, movestogo, ms, soft);
             }
             stop = false;
             pondering = ponder;

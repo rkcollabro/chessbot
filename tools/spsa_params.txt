@@ -14,3 +14,9 @@ HIST_MULT    2
 HIST_MAX     150
 ASP_DELTA    4
 QS_FUT       15
+TM_TOGO      3
+TM_INC       6
+TM_MAX       40
+TM_INSTAB    25
+TM_DROP      20
+TM_STABLE    5

@@ -61,3 +61,5 @@ struct TuneParam {
 };
 std::vector<TuneParam>& tuneParams();
 void tuneChanged();
+// Clock games: hard limit (ms) and target time (soft) for a move with `left` ms on the clock.
+void allocateTime(int left, int inc, int movestogo, int& ms, int& soft);

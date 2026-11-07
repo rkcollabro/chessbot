@@ -189,6 +189,25 @@ constexpr bool F_CONT = SF & 1, F_CAP = SF & 2, F_NPCORR = SF & 4, F_RAZOR = SF 
 #ifndef QS_FUT
 #define QS_FUT 139  // qsearch futility margin
 #endif
+// Time management (clock games).
+#ifndef TM_TOGO
+#define TM_TOGO 25  // moves assumed left when the GUI gives no movestogo
+#endif
+#ifndef TM_INC
+#define TM_INC 75  // percent of the increment added to the target
+#endif
+#ifndef TM_MAX
+#define TM_MAX 500  // percent of the target allowed at most (also capped at a third of the clock)
+#endif
+#ifndef TM_INSTAB
+#define TM_INSTAB 150  // percent extra time per unit of best-move instability
+#endif
+#ifndef TM_DROP
+#define TM_DROP 100  // score drop (cp) that doubles the target
+#endif
+#ifndef TM_STABLE
+#define TM_STABLE 70  // percent of the target once the best move has held for six iterations
+#endif
 
 // With -DTUNE the parameters become UCI options (for SPSA); otherwise they are compile-time constants.
 #ifdef TUNE
@@ -221,6 +240,12 @@ TP(HIST_MULT, 4, 32)
 TP(HIST_MAX, 600, 3200)
 TP(ASP_DELTA, 10, 60)
 TP(QS_FUT, 50, 300)
+TP(TM_TOGO, 10, 50)
+TP(TM_INC, 30, 100)
+TP(TM_MAX, 200, 800)
+TP(TM_INSTAB, 0, 400)
+TP(TM_DROP, 30, 300)
+TP(TM_STABLE, 40, 100)
 
 // Late move reduction amounts by [depth][move number].
 int LMR[64][64];
@@ -1072,9 +1097,9 @@ public:
                 bool changed = best != prevBest;
                 instability = instability * 0.5 + (changed && depth >= 5 ? 1.0 : 0.0);
                 stableIters = changed ? 0 : stableIters + 1;
-                double scale = 1.0 + 1.5 * instability;
-                if (depth >= 5) scale *= 1.0 + std::clamp((prevScore - score) / 100.0, 0.0, 1.0);
-                if (stableIters >= 6) scale *= 0.7;
+                double scale = 1.0 + P_TM_INSTAB / 100.0 * instability;
+                if (depth >= 5) scale *= 1.0 + std::clamp(double(prevScore - score) / P_TM_DROP, 0.0, 1.0);
+                if (stableIters >= 6) scale *= P_TM_STABLE / 100.0;
                 // Most of the effort going into the best move means the alternatives were refuted quickly.
                 if (NODE_TM && depth >= 6 && nodes > nodesAtStart) {
                     double f = double(rootNodes[moveFrom(best)][moveTo(best)]) / double(nodes - nodesAtStart);
@@ -1129,6 +1154,15 @@ std::vector<TuneParam>& tuneParams() {
 #endif
 }
 void tuneChanged() { initLMR(); }
+
+void allocateTime(int left, int inc, int movestogo, int& ms, int& soft) {
+    // Aim for a share of the remaining clock, and allow up to TM_MAX percent of that (but never more than a
+    // third of the clock) when the search is unsettled.
+    int togo = movestogo > 0 ? std::min(movestogo, 40) : P_TM_TOGO;
+    soft = left / togo + inc * P_TM_INC / 100;
+    ms = std::max(10, std::min(int(int64_t(soft) * P_TM_MAX / 100), left / 3));
+    soft = std::max(5, std::min(soft, ms));
+}
 
 Move findBestMove(const Board& root, int timeMs, std::atomic<bool>* stop, const InfoFn& info, bool useBook,
                   int threads, int maxNodes, int evalNoise, int softMs, std::atomic<bool>* ponder,
