@@ -114,19 +114,18 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (cmd == "nnueraw" && argc > 2) {  // raw network output, side to move's view; one FEN per line on stdin with "-"
-        if (!nnue::active()) return std::printf("no network loaded
-"), 1;
+        if (!nnue::active()) return std::printf("no network loaded\n"), 1;
         std::string fen = joinArgs(argc, argv, 2);
         auto one = [](const std::string& f) {
             Board b;
-            if (!b.setFEN(f)) return std::printf("bad fen
-"), void();
-            std::printf("%d
-", nnue::evaluate(b));
+            if (!b.setFEN(f)) {
+                std::printf("bad fen\n");
+                return;
+            }
+            std::printf("%d\n", nnue::evaluate(b));
         };
         if (fen == "-")
-            for (char line[256]; std::fgets(line, sizeof line, stdin);) one(std::string(line, std::strcspn(line, "
-")));
+            for (char line[256]; std::fgets(line, sizeof line, stdin);) one(std::string(line, std::strcspn(line, "\r\n")));
         else
             one(fen);
         return 0;
