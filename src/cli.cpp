@@ -12,11 +12,13 @@
 //   chesscli tune <data.txt> <out.inc> [epochs]
 //   chesscli selfplay <out.bin> <games> <nodes> <seed>   NNUE training data from self-play
 //   chesscli eval <fen>           static evaluation (NNUE when nnue.bin is next to the exe)
+//   chesscli nnueraw <fen>        raw network output only (no scaling), for checking a converted network
 //   chesscli nnuecheck <games>    incremental NNUE updates vs. a full rebuild over random games
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #ifdef _WIN32
 #include <io.h>
 #define isatty _isatty
@@ -109,6 +111,24 @@ int main(int argc, char** argv) {
         Board b;
         if (!b.setFEN(joinArgs(argc, argv, 2))) return std::printf("bad fen\n"), 1;
         std::printf("%d\n", evaluate(b));
+        return 0;
+    }
+    if (cmd == "nnueraw" && argc > 2) {  // raw network output, side to move's view; one FEN per line on stdin with "-"
+        if (!nnue::active()) return std::printf("no network loaded
+"), 1;
+        std::string fen = joinArgs(argc, argv, 2);
+        auto one = [](const std::string& f) {
+            Board b;
+            if (!b.setFEN(f)) return std::printf("bad fen
+"), void();
+            std::printf("%d
+", nnue::evaluate(b));
+        };
+        if (fen == "-")
+            for (char line[256]; std::fgets(line, sizeof line, stdin);) one(std::string(line, std::strcspn(line, "
+")));
+        else
+            one(fen);
         return 0;
     }
     if (cmd == "nnuecheck" && argc > 2) {
