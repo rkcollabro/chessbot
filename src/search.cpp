@@ -145,49 +145,49 @@ constexpr bool F_CONT = SF & 1, F_CAP = SF & 2, F_NPCORR = SF & 4, F_RAZOR = SF 
 #define HP_MULT 2000
 #endif
 #ifndef RFP_MARGIN
-#define RFP_MARGIN 79
+#define RFP_MARGIN 72
 #endif
 #ifndef FUT_BASE
-#define FUT_BASE 113
+#define FUT_BASE 115
 #endif
 #ifndef FUT_MULT
-#define FUT_MULT 95
+#define FUT_MULT 94
 #endif
 #ifndef LMR_BASE
-#define LMR_BASE 88  // hundredths
+#define LMR_BASE 95  // hundredths
 #endif
 #ifndef LMR_DIV
-#define LMR_DIV 214  // hundredths
+#define LMR_DIV 213  // hundredths
 #endif
 #ifndef NODE_TM
 #define NODE_TM 0  // 1: also scale the time target by the share of nodes spent on the best root move
 #endif
 #ifndef NMP_EVAL
-#define NMP_EVAL 192  // null-move reduction grows by one per this much eval above beta (up to 3)
+#define NMP_EVAL 200  // null-move reduction grows by one per this much eval above beta (up to 3)
 #endif
 #ifndef SEE_QUIET
-#define SEE_QUIET 60  // SEE pruning thresholds per depth
+#define SEE_QUIET 55  // SEE pruning thresholds per depth
 #endif
 #ifndef SEE_CAP
-#define SEE_CAP 76
+#define SEE_CAP 67
 #endif
 #ifndef DEXT_MARGIN
 #define DEXT_MARGIN 30  // singular-search margin below which the TT move gets a double extension
 #endif
 #ifndef LMR_HIST
-#define LMR_HIST 9120  // history per ply of LMR adjustment
+#define LMR_HIST 6906  // history per ply of LMR adjustment
 #endif
 #ifndef HIST_MULT
-#define HIST_MULT 19  // history bonus: min(HIST_MULT * depth^2, HIST_MAX)
+#define HIST_MULT 20  // history bonus: min(HIST_MULT * depth^2, HIST_MAX)
 #endif
 #ifndef HIST_MAX
-#define HIST_MAX 1688
+#define HIST_MAX 1753
 #endif
 #ifndef ASP_DELTA
-#define ASP_DELTA 21  // initial aspiration window half-width
+#define ASP_DELTA 22  // initial aspiration window half-width
 #endif
 #ifndef QS_FUT
-#define QS_FUT 139  // qsearch futility margin
+#define QS_FUT 142  // qsearch futility margin
 #endif
 
 // With -DTUNE the parameters become UCI options (for SPSA); otherwise they are compile-time constants.
