@@ -122,7 +122,7 @@ struct Undo {
 // NNUE first-layer sums for one position (see nnue.cpp). Each move records the pieces it added and removed,
 // and the sums are brought up to date lazily from the nearest computed ancestor when the position is evaluated.
 #ifndef NNUE_HIDDEN_SIZE
-#define NNUE_HIDDEN_SIZE 512  // must match the network file; build with -DNNUE_HIDDEN_SIZE=256 for gen3 and older nets
+#define NNUE_HIDDEN_SIZE 1024  // must match the network file; build with -DNNUE_HIDDEN_SIZE=512 for gen6 and older nets
 #endif
 constexpr int NNUE_HIDDEN = NNUE_HIDDEN_SIZE;
 struct NnueAccum {
