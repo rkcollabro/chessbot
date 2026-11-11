@@ -3,9 +3,19 @@
 // output buckets. Saved quantised (QA 255, QB 64): l0w [buckets*768][HL], l0b [HL], l1w [8][2*HL] (side to
 // move half first), l1b [8] - exactly what tools/bullet_to_cbn2.py turns into the engine's CBN2 format.
 //
-// usage: gtrain <bullet|binpack> <net_id> <superbatches> <wdl> <hl> <data file>...
+// usage: gtrain <bullet|binpack|mix<f>> <net_id> <superbatches> <wdl> <hl> <data file>...
+//   bullet: our data converted by prep.py; binpack: Stockfish binpacks (Leela data);
+//   mix<f>, e.g. mix0.25: both at once, files ending in .binpack read as binpacks and the rest as bullet files,
+//   with a fraction f of every batch taken from the bullet files.
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
+
 use bullet_lib::{
     game::{
+        formats::bulletformat::ChessBoard,
         inputs::{ChessBucketsMirrored, get_num_buckets},
         outputs::MaterialCount,
     },
@@ -20,6 +30,67 @@ use bullet_lib::{
     },
     value::{ValueTrainerBuilder, loader},
 };
+use bullet_trainer::reader::DataReader;
+
+// Two readers blended into one stream: each runs on its own thread, and every output chunk takes a fixed share
+// from each and is shuffled, so every batch holds both kinds of data in the set proportion.
+#[derive(Clone)]
+struct Mix<A, B> {
+    a: A,
+    b: B,
+    frac_b: f64,
+}
+
+fn feed<R: DataReader<ChessBoard>>(r: R, stop: Arc<AtomicBool>) -> mpsc::Receiver<Vec<ChessBoard>> {
+    let (tx, rx) = mpsc::sync_channel(2);
+    std::thread::spawn(move || r.read_chunks(0, |c| stop.load(Ordering::Relaxed) || tx.send(c.to_vec()).is_err()));
+    rx
+}
+
+fn take(rx: &mpsc::Receiver<Vec<ChessBoard>>, buf: &mut Vec<ChessBoard>, at: &mut usize, mut n: usize,
+        out: &mut Vec<ChessBoard>) -> bool {
+    while n > 0 {
+        if *at == buf.len() {
+            match rx.recv() {
+                Ok(v) => (*buf, *at) = (v, 0),
+                Err(_) => return false,
+            }
+            continue;
+        }
+        let k = n.min(buf.len() - *at);
+        out.extend_from_slice(&buf[*at..*at + k]);
+        *at += k;
+        n -= k;
+    }
+    true
+}
+
+impl<A: DataReader<ChessBoard>, B: DataReader<ChessBoard>> DataReader<ChessBoard> for Mix<A, B> {
+    fn read_chunks<F: FnMut(&[ChessBoard]) -> bool>(&self, _skip: usize, mut f: F) {
+        const OUT: usize = 1 << 20;
+        let nb = (OUT as f64 * self.frac_b).round() as usize;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ra, rb) = (feed(self.a.clone(), stop.clone()), feed(self.b.clone(), stop.clone()));
+        let (mut ba, mut bb, mut ia, mut ib) = (Vec::new(), Vec::new(), 0, 0);
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        loop {
+            let mut out = Vec::with_capacity(OUT);
+            if !take(&ra, &mut ba, &mut ia, OUT - nb, &mut out) || !take(&rb, &mut bb, &mut ib, nb, &mut out) {
+                break;
+            }
+            for i in (1..out.len()).rev() {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                out.swap(i, (seed % (i as u64 + 1)) as usize);
+            }
+            if f(&out) {
+                break;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+    }
+}
 
 #[rustfmt::skip]
 const BUCKET_LAYOUT: [usize; 32] = [
@@ -95,17 +166,25 @@ fn main() {
     let settings = LocalSettings { threads: 2, test_set: None, output_directory: "checkpoints", batch_queue_size: 32 };
     let paths: Vec<&str> = data.iter().map(|s| s.as_str()).collect();
 
+    use loader::sfbinpack::{MoveType, PieceType, SfBinpackLoader, TrainingDataEntry};
+    // Same quiet-position filter our self-play data already applies when it is written.
+    fn filter(entry: &TrainingDataEntry) -> bool {
+        entry.ply >= 16
+            && !entry.pos.is_checked(entry.pos.side_to_move())
+            && entry.score.unsigned_abs() <= 10000
+            && entry.mv.mtype() == MoveType::Normal
+            && entry.pos.piece_at(entry.mv.to()).piece_type() == PieceType::None
+    }
     if kind == "binpack" {
-        use loader::sfbinpack::{MoveType, PieceType, SfBinpackLoader, TrainingDataEntry};
-        // Same quiet-position filter our self-play data already applies when it is written.
-        fn filter(entry: &TrainingDataEntry) -> bool {
-            entry.ply >= 16
-                && !entry.pos.is_checked(entry.pos.side_to_move())
-                && entry.score.unsigned_abs() <= 10000
-                && entry.mv.mtype() == MoveType::Normal
-                && entry.pos.piece_at(entry.mv.to()).piece_type() == PieceType::None
-        }
         let dl = SfBinpackLoader::new_concat_multiple(&paths, 1024, 2, filter);
+        trainer.run(&schedule, &settings, &dl);
+    } else if let Some(frac) = kind.strip_prefix("mix") {
+        let (bp, ours): (Vec<&str>, Vec<&str>) = paths.iter().copied().partition(|p| p.ends_with(".binpack"));
+        let dl = Mix {
+            a: SfBinpackLoader::new_concat_multiple(&bp, 1024, 2, filter),
+            b: loader::DirectSequentialDataLoader::new(&ours),
+            frac_b: frac.parse().unwrap(),
+        };
         trainer.run(&schedule, &settings, &dl);
     } else {
         let dl = loader::DirectSequentialDataLoader::new(&paths);
