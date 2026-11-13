@@ -114,7 +114,8 @@ fn main() {
     let wdl_proportion: f32 = args[4].parse().unwrap();
     let hl_size: usize = args[5].parse().unwrap();
     let data: Vec<String> = args[6..].to_vec();
-    let initial_lr = 0.001;
+    // INIT_LR: a lower starting rate when continuing from INIT_WEIGHTS (a second cosine cycle).
+    let initial_lr: f32 = std::env::var("INIT_LR").map(|s| s.parse().unwrap()).unwrap_or(0.001);
     let final_lr = 0.001 * 0.3f32.powi(5);
 
     let mut trainer = ValueTrainerBuilder::default()
@@ -149,6 +150,15 @@ fn main() {
     let stricter_clipping = AdamWParams { max_weight: 0.99, min_weight: -0.99, ..Default::default() };
     trainer.optimiser.set_params_for_weight("l0w", stricter_clipping);
     trainer.optimiser.set_params_for_weight("l0f", stricter_clipping);
+
+    // INIT_WEIGHTS: start from a previous net (Bullet weights file made by tools/bignet/dequant.py from a
+    // quantised.bin; l0f stays zero since the saved l0w already includes it). init_check.bin is that net
+    // quantised again, for the caller to compare with the original.
+    if let Ok(p) = std::env::var("INIT_WEIGHTS") {
+        trainer.optimiser.load_weights_from_file(&p).map_err(|e| format!("{e:?}")).unwrap();
+        trainer.save_quantised("init_check.bin").unwrap();
+        println!("loaded initial weights from {p}");
+    }
 
     let schedule = TrainingSchedule {
         net_id: net_id.clone(),
