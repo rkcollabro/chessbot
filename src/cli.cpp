@@ -284,9 +284,9 @@ int main(int argc, char** argv) {
             sig = sig * 1000003 + (uint64_t(last.depth) << 40 | uint64_t(last.score + 40000) << 20 | (m & 0xFFFFF));
         }
         long long t = std::max(1LL, ms() - t0);
-        std::printf("signature %016llx  nodes %llu  time %lld ms  %llu nodes/s  large pages %s\n",
+        std::printf("signature %016llx  nodes %llu  time %lld ms  %llu nodes/s  large pages %s (net %s)\n",
                     (unsigned long long)sig, (unsigned long long)total, t, (unsigned long long)(total * 1000 / t),
-                    hashOnLargePages() ? "yes" : "no");
+                    hashOnLargePages() ? "yes" : "no", nnue::weightsOnLargePages() ? "yes" : "no");
         return 0;
     }
 
