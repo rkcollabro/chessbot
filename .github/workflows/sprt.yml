@@ -48,6 +48,11 @@ on:
         type: choice
         options: [none, cand, base, both]
         default: none
+      openings:
+        description: Opening suite (uho = 20k unbalanced UHO_Lichess_4852 positions, fewer draws; elite = 3000 balanced 8-ply lines)
+        type: choice
+        options: [uho, elite]
+        default: uho
       round:
         description: Round number (set by the previous round; leave at 1)
         default: "1"
@@ -141,10 +146,11 @@ jobs:
           CONC: ${{ inputs.concurrency || '4' }}
         run: |
           # Every round and shard starts at its own opening, so later rounds move on through the book.
-          offset=$(( ((ROUND - 1) * JOBS * PAIRS + ${{ matrix.shard }} * PAIRS) % 3000 ))
+          if [ "${{ inputs.openings || 'uho' }}" = elite ]; then book=tools/openings.txt; else book=tools/openings_uho.txt; fi
+          offset=$(( ((ROUND - 1) * JOBS * PAIRS + ${{ matrix.shard }} * PAIRS) % $(wc -l < "$book") ))
           bin() { if [ -f "eng/$1/stockfish" ]; then echo "eng/$1/stockfish"; else echo "eng/$1/chesscli"; fi; }
           python3 tools/sprt.py "$(bin cand)" "$(bin base)" --fixed "$PAIRS" --offset "$offset" \
-            --tc "$TC" --concurrency "$CONC" --book "${{ inputs.book || 'none' }}" --json "result-${{ matrix.shard }}.json"             --cand-options "$CAND_OPTS" --base-options "$BASE_OPTS"
+            --tc "$TC" --concurrency "$CONC" --book "${{ inputs.book || 'none' }}" --openings "$book" --json "result-${{ matrix.shard }}.json"             --cand-options "$CAND_OPTS" --base-options "$BASE_OPTS"
       - uses: actions/upload-artifact@v4
         with:
           name: result-${{ matrix.shard }}
@@ -194,5 +200,5 @@ jobs:
             -f candidate="${{ inputs.candidate }}" -f base="${{ inputs.base }}" -f tc="${{ inputs.tc }}" \
             -f elo0="${{ inputs.elo0 }}" -f elo1="${{ inputs.elo1 }}" -f max_rounds="${{ inputs.max_rounds }}" \
             -f candidate_flags="${{ inputs.candidate_flags }}" -f base_flags="${{ inputs.base_flags }}" \
-            -f book="${{ inputs.book || 'none' }}" -f candidate_options="${{ inputs.candidate_options }}"             -f base_options="${{ inputs.base_options }}" -f concurrency="${{ inputs.concurrency || '4' }}" -f round="$(( ${{ inputs.round }} + 1 ))" -f prev_run="${{ github.run_id }}"
+            -f book="${{ inputs.book || 'none' }}" -f openings="${{ inputs.openings || 'uho' }}" -f candidate_options="${{ inputs.candidate_options }}"             -f base_options="${{ inputs.base_options }}" -f concurrency="${{ inputs.concurrency || '4' }}" -f round="$(( ${{ inputs.round }} + 1 ))" -f prev_run="${{ github.run_id }}"
           echo "Round $(( ${{ inputs.round }} + 1 )) dispatched." >> "$GITHUB_STEP_SUMMARY"

@@ -38,9 +38,12 @@ def play(engines, opening, tc, settings=None):
     and is told its clock is this much shorter than it is, as lichess-bot's move_overhead does."""
     settings = settings or {}
     base, inc = tc
-    board = chess.Board()
-    for uci in opening.split():
-        board.push_uci(uci)
+    if "/" in opening:  # a FEN (e.g. the UHO suite, tools/openings_uho.txt)
+        board = chess.Board(opening)
+    else:  # a sequence of UCI moves from the start position
+        board = chess.Board()
+        for uci in opening.split():
+            board.push_uci(uci)
     game = object()  # a new game key makes python-chess send "ucinewgame"
     clock = {chess.WHITE: base, chess.BLACK: base}
     lopsided = 0
