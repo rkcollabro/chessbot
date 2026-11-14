@@ -201,7 +201,7 @@ constexpr bool F_CONT = SF & 1, F_CAP = SF & 2, F_NPCORR = SF & 4, F_RAZOR = SF 
 #define E_CUTIIR 0    // internal iterative reduction one more ply at cut nodes
 #endif
 #ifndef E_CUTSE
-#define E_CUTSE 0     // singular search fails at a cut node: reduce the TT move by 2 plies
+#define E_CUTSE 1     // singular search fails at a cut node: reduce the TT move by 2 plies
 #endif
 #ifndef E_TTPV
 #define E_TTPV 0      // remember PV positions in the TT; reduce them one ply less outside the PV
@@ -228,7 +228,7 @@ constexpr bool F_CONT = SF & 1, F_CAP = SF & 2, F_NPCORR = SF & 4, F_RAZOR = SF 
 #define E_TTEVAL 0    // pruning eval adjusted by a usable TT bound (RFP, null move, futility)
 #endif
 #ifndef E_RFPFIRM
-#define E_RFPFIRM 0   // reverse futility returns (eval + beta) / 2 instead of eval
+#define E_RFPFIRM 1   // reverse futility returns (eval + beta) / 2 instead of eval
 #endif
 #ifndef E_IMPROVE
 #define E_IMPROVE 0   // `improving` looks 4 plies back when 2 plies back was in check
