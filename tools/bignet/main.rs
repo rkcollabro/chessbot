@@ -118,33 +118,72 @@ fn main() {
     let initial_lr: f32 = std::env::var("INIT_LR").map(|s| s.parse().unwrap()).unwrap_or(0.001);
     let final_lr = 0.001 * 0.3f32.powi(5);
 
+    // ARCH=ml: multi-layer net (Bullet's 4_multi_layer example): l0 HL CReLU, each perspective's two halves
+    // multiplied pairwise (HL/2 each) -> l1 16 SCReLU -> l2 32 SCReLU -> l3 1, l1-l3 per output bucket.
+    // Saved: l0w/l0b i16 (QA 255) as above, l1w i16 [8*16][HL] (QB 256, row = bucket * 16 + neuron; i8 with
+    // QB 64 was too coarse for the small l1 weights and moved evaluations by up to 20%), then f32:
+    // l1b [8*16], l2w [8*32][16], l2b [8*32], l3w [8][32], l3b [8] - tools/bullet_to_cbn3.py makes CBN3 from it.
+    let ml = std::env::var("ARCH").map(|s| s == "ml").unwrap_or(false);
+    const L2: usize = 16;
+    const L3: usize = 32;
+    let l0w_fmt = SavedFormat::id("l0w")
+        .transform(|store, weights| {
+            let factoriser = store.get("l0f").values.f32().repeat(NUM_INPUT_BUCKETS);
+            weights.into_iter().zip(factoriser).map(|(a, b)| a + b).collect()
+        })
+        .round()
+        .quantise::<i16>(255);
+    let formats = if ml {
+        vec![
+            l0w_fmt,
+            SavedFormat::id("l0b").round().quantise::<i16>(255),
+            SavedFormat::id("l1w").transpose().round().quantise::<i16>(256),
+            SavedFormat::id("l1b"),
+            SavedFormat::id("l2w").transpose(),
+            SavedFormat::id("l2b"),
+            SavedFormat::id("l3w").transpose(),
+            SavedFormat::id("l3b"),
+        ]
+    } else {
+        vec![
+            l0w_fmt,
+            SavedFormat::id("l0b").round().quantise::<i16>(255),
+            SavedFormat::id("l1w").round().quantise::<i16>(64).transpose(),
+            SavedFormat::id("l1b").round().quantise::<i16>(255 * 64),
+        ]
+    };
     let mut trainer = ValueTrainerBuilder::default()
         .dual_perspective()
         .optimiser(AdamW)
         .inputs(ChessBucketsMirrored::new(BUCKET_LAYOUT))
         .output_buckets(MaterialCount::<NUM_OUTPUT_BUCKETS>)
-        .save_format(&[
-            SavedFormat::id("l0w")
-                .transform(|store, weights| {
-                    let factoriser = store.get("l0f").values.f32().repeat(NUM_INPUT_BUCKETS);
-                    weights.into_iter().zip(factoriser).map(|(a, b)| a + b).collect()
-                })
-                .round()
-                .quantise::<i16>(255),
-            SavedFormat::id("l0b").round().quantise::<i16>(255),
-            SavedFormat::id("l1w").round().quantise::<i16>(64).transpose(),
-            SavedFormat::id("l1b").round().quantise::<i16>(255 * 64),
-        ])
+        .save_format(&formats)
         .loss_fn(|output, target| output.sigmoid().squared_error(target))
         .build(|builder, stm_inputs, ntm_inputs, output_buckets| {
             let l0f = builder.new_weights("l0f", Shape::new(hl_size, 768), InitSettings::Zeroed);
             let expanded_factoriser = l0f.repeat(NUM_INPUT_BUCKETS);
             let mut l0 = builder.new_affine("l0", 768 * NUM_INPUT_BUCKETS, hl_size);
+            if ml {
+                l0.init_with_effective_input_size(32);
+            }
             l0.weights = l0.weights + expanded_factoriser;
-            let l1 = builder.new_affine("l1", 2 * hl_size, NUM_OUTPUT_BUCKETS);
-            let stm_hidden = l0.forward(stm_inputs).screlu();
-            let ntm_hidden = l0.forward(ntm_inputs).screlu();
-            l1.forward(stm_hidden.concat(ntm_hidden)).select(output_buckets)
+            if ml {
+                let l1 = builder.new_affine("l1", hl_size, NUM_OUTPUT_BUCKETS * L2);
+                let l2 = builder.new_affine("l2", L2, NUM_OUTPUT_BUCKETS * L3);
+                let l3 = builder.new_affine("l3", L3, NUM_OUTPUT_BUCKETS);
+                let ft = |input, start, end| l0.slice(start, end).forward(input).crelu();
+                let stm_hidden = ft(stm_inputs, 0, hl_size / 2) * ft(stm_inputs, hl_size / 2, hl_size);
+                let ntm_hidden = ft(ntm_inputs, 0, hl_size / 2) * ft(ntm_inputs, hl_size / 2, hl_size);
+                let hl1 = stm_hidden.concat(ntm_hidden);
+                let hl2 = l1.forward(hl1).select(output_buckets).screlu();
+                let hl3 = l2.forward(hl2).select(output_buckets).screlu();
+                l3.forward(hl3).select(output_buckets)
+            } else {
+                let l1 = builder.new_affine("l1", 2 * hl_size, NUM_OUTPUT_BUCKETS);
+                let stm_hidden = l0.forward(stm_inputs).screlu();
+                let ntm_hidden = l0.forward(ntm_inputs).screlu();
+                l1.forward(stm_hidden.concat(ntm_hidden)).select(output_buckets)
+            }
         });
 
     let stricter_clipping = AdamWParams { max_weight: 0.99, min_weight: -0.99, ..Default::default() };
@@ -158,6 +197,13 @@ fn main() {
         trainer.optimiser.load_weights_from_file(&p).map_err(|e| format!("{e:?}")).unwrap();
         trainer.save_quantised("init_check.bin").unwrap();
         println!("loaded initial weights from {p}");
+        // EVAL_ONLY: just print that net's evaluations of EVAL_FENS.
+        if std::env::var("EVAL_ONLY").is_ok() {
+            for fen in EVAL_FENS {
+                println!("EVAL {:.2} {fen}", 400.0 * trainer.eval(&format!("{fen} | 0 | 0.5")));
+            }
+            return;
+        }
     }
 
     let schedule = TrainingSchedule {
@@ -200,4 +246,24 @@ fn main() {
         let dl = loader::DirectSequentialDataLoader::new(&paths);
         trainer.run(&schedule, &settings, &dl);
     }
+
+    // The final net's own evaluations (centipawns, side to move), to check the engine's inference against.
+    for fen in EVAL_FENS {
+        println!("EVAL {:.2} {fen}", 400.0 * trainer.eval(&format!("{fen} | 0 | 0.5")));
+    }
 }
+
+// The last three are colour-flipped copies of three Black-to-move positions above: same evaluation expected.
+const EVAL_FENS: [&str; 11] = [
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    "r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 4 4",
+    "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+    "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+    "r2q1rk1/pP1p2pp/Q4n2/bbp1p3/Np6/1B3NBn/pPPP1PPP/R3K2R b KQ - 0 1",
+    "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+    "6k1/5ppp/8/8/8/8/5PPP/3R2K1 b - - 0 1",
+    "2kr3r/ppp2ppp/2n5/2b1q3/4P3/2N2N2/PPP2PPP/R2QKB1R b KQ - 3 10",
+    "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+    "3r2k1/5ppp/8/8/8/8/5PPP/6K1 w - - 0 1",
+    "r2qkb1r/ppp2ppp/2n2n2/4p3/2B1Q3/2N5/PPP2PPP/2KR3R w kq - 3 10",
+];
