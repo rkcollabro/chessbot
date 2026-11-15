@@ -1,5 +1,7 @@
 #include "nnue.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -58,6 +60,10 @@ struct Net {
     int l2 = 0, l3 = 0;
     std::vector<int16_t> l1w;
     int16_t* l1wPairs = nullptr;  // l1w rearranged for the sparse loop, when l2 == 16: [bucket][HIDDEN/2][16][2]
+    // 8-bit l1 (AVX2, l2 == 16): l1w as int8 in groups of four inputs, [bucket][HIDDEN/4][16][4], at scale
+    // qb8 (qb, or less when the largest weight needs it), against 8-bit pairwise products.
+    int8_t* l1wQuads = nullptr;
+    float qb8 = 0;
     std::vector<float> l1b, l2w, l2b, l3w, l3b;  // [b][l2], [b][l3][l2], [b][l3], [b][l3], [b]
     std::vector<float> l2wT;                     // l2w as [b][l2][l3]
 };
@@ -166,6 +172,28 @@ bool load(const std::string& path) {
                                     g_net.l1w[(size_t(bk) * 16 + j) * HIDDEN + 2 * i + k];
                 g_net.l1wPairs = p;
             }
+#if defined(NNUE_AVX2) && !defined(NNUE_L1_I16)
+            g_net.l1wQuads = nullptr;
+            if (ok && l2 == 16) {
+                // u8 inputs (<= 254) times int8 weights, summed in pairs into int16 by maddubs: |w| <= 64 keeps
+                // 2 * 254 * 64 below 32767, so weights beyond 64 are scaled down to fit (no saturation ever).
+                int maxAbs = 1;
+                for (int16_t w : g_net.l1w) maxAbs = std::max(maxAbs, std::abs(int(w)));
+                const double f = maxAbs > 64 ? 64.0 / maxAbs : 1.0;
+                g_net.qb8 = float(qb * f);
+                static std::vector<int8_t> quadStore;
+                quadStore.assign(size_t(buckets) * HIDDEN * 16 + 32, 0);
+                int8_t* q = quadStore.data();
+                q += (32 - reinterpret_cast<uintptr_t>(q) % 32) % 32;
+                for (int bk = 0; bk < buckets; bk++)
+                    for (int g = 0; g < HIDDEN / 4; g++)
+                        for (int j = 0; j < 16; j++)
+                            for (int k = 0; k < 4; k++)
+                                q[((size_t(bk) * (HIDDEN / 4) + g) * 16 + j) * 4 + k] =
+                                    int8_t(std::lround(g_net.l1w[(size_t(bk) * 16 + j) * HIDDEN + 4 * g + k] * f));
+                g_net.l1wQuads = q;
+            }
+#endif
         } else {
             ok = ok && readAll(g_net.outWeights, size_t(buckets) * 2 * HIDDEN) &&
                  std::fread(g_net.outBias, 4, buckets, f) == size_t(buckets);
@@ -465,23 +493,84 @@ void l1Sparse(const int16_t* x, const int16_t* wp, int32_t* out) {
 }
 #endif
 
+#if defined(NNUE_AVX2)
+// 8-bit form of pairwise: products rounded to 8 bits, (a * c + 128) >> 8 <= 254, as unsigned bytes.
+void pairwise8(const int16_t* acc, uint8_t* out) {
+    constexpr int H = HIDDEN / 2;
+    const __m256i zero = _mm256_setzero_si256(), qa = _mm256_set1_epi16(QA), half = _mm256_set1_epi16(128);
+    auto cl = [&](const int16_t* p) {
+        return _mm256_min_epi16(_mm256_max_epi16(_mm256_loadu_si256((const __m256i*)p), zero), qa);
+    };
+    auto prod = [&](int i) {  // at most 65025 + 128: exact as unsigned 16-bit
+        return _mm256_srli_epi16(_mm256_add_epi16(_mm256_mullo_epi16(cl(acc + i), cl(acc + H + i)), half), 8);
+    };
+    for (int i = 0; i < H; i += 32) {
+        // packus interleaves the 128-bit lanes; the permute puts the 32 bytes back in order.
+        __m256i b = _mm256_packus_epi16(prod(i), prod(i + 16));
+        _mm256_storeu_si256((__m256i*)(out + i), _mm256_permute4x64_epi64(b, 0xD8));
+    }
+}
+
+// l1 for 16 outputs over the nonzero groups of four 8-bit inputs: each group broadcasts its 4 bytes, maddubs
+// multiplies them by 16 outputs x 4 int8 weights (adjacent pairs summed into int16, which cannot saturate given
+// the weight bound), and madd by ones finishes each output's 4-term sum in int32.
+void l1Sparse8(const uint8_t* x, const int8_t* wq, int32_t* out) {
+    const int32_t* x32 = reinterpret_cast<const int32_t*>(x);
+    alignas(16) uint16_t nz[HIDDEN / 4 + 8];
+    int n = 0;
+    const __m256i zero = _mm256_setzero_si256();
+    __m128i base = _mm_setzero_si128();
+    const __m128i eight = _mm_set1_epi16(8);
+    for (int i = 0; i < HIDDEN / 4; i += 8) {
+        __m256i v = _mm256_loadu_si256((const __m256i*)(x32 + i));
+        unsigned m = ~unsigned(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, zero)))) & 0xFF;
+        _mm_storeu_si128((__m128i*)(nz + n), _mm_add_epi16(base, _mm_load_si128((const __m128i*)g_nzTable.idx[m])));
+        n += _mm_popcnt_u32(m);
+        base = _mm_add_epi16(base, eight);
+    }
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256i s0 = _mm256_setzero_si256(), s1 = _mm256_setzero_si256();
+    for (int k = 0; k < n; k++) {
+        const int p = nz[k];
+        const __m256i in = _mm256_set1_epi32(x32[p]);
+        const int8_t* w = wq + size_t(p) * 64;
+        s0 = _mm256_add_epi32(s0, _mm256_madd_epi16(_mm256_maddubs_epi16(in, _mm256_load_si256((const __m256i*)w)), ones));
+        s1 = _mm256_add_epi32(s1, _mm256_madd_epi16(_mm256_maddubs_epi16(in, _mm256_load_si256((const __m256i*)(w + 32))), ones));
+    }
+    _mm256_storeu_si256((__m256i*)out, s0);
+    _mm256_storeu_si256((__m256i*)(out + 8), s1);
+}
+#endif
+
 // CBN3 output for one output bucket: pairwise products of both perspectives (side to move first) -> l1
 // -> SCReLU -> l2 -> SCReLU -> l3, in units of the network's output (1.0 = SCALE centipawns).
 float layers(const NnueAccum& a, int stm, int bucket) {
     const Net& n = g_net;
-    alignas(32) int16_t x[HIDDEN];
-    pairwise(a.v[stm], x);
-    pairwise(a.v[stm ^ 1], x + HIDDEN / 2);
-    // x = trained product * QA * QA >> PAIR_SHIFT, and the weights are scaled by qb.
-    const float s1 = float(1 << PAIR_SHIFT) / (float(QA) * QA * n.qb);
     float h1[MAX_L2], h2[MAX_L3];
     int32_t sums[MAX_L2];
+    float s1;
 #if defined(NNUE_AVX2)
-    if (n.l2 == 16)
-        l1Sparse(x, n.l1wPairs + size_t(bucket) * (HIDDEN / 2) * 32, sums);
-    else
+    if (n.l1wQuads) {
+        alignas(32) uint8_t x8[HIDDEN];
+        pairwise8(a.v[stm], x8);
+        pairwise8(a.v[stm ^ 1], x8 + HIDDEN / 2);
+        l1Sparse8(x8, n.l1wQuads + size_t(bucket) * HIDDEN * 16, sums);
+        s1 = 256.0f / (float(QA) * QA * n.qb8);  // x8 = trained product * QA * QA / 256, weights scaled by qb8
+    } else
 #endif
-        for (int j = 0; j < n.l2; j++) sums[j] = dotPairs(x, &n.l1w[(size_t(bucket) * n.l2 + j) * HIDDEN]);
+    {
+        alignas(32) int16_t x[HIDDEN];
+        pairwise(a.v[stm], x);
+        pairwise(a.v[stm ^ 1], x + HIDDEN / 2);
+        // x = trained product * QA * QA >> PAIR_SHIFT, and the weights are scaled by qb.
+        s1 = float(1 << PAIR_SHIFT) / (float(QA) * QA * n.qb);
+#if defined(NNUE_AVX2)
+        if (n.l2 == 16)
+            l1Sparse(x, n.l1wPairs + size_t(bucket) * (HIDDEN / 2) * 32, sums);
+        else
+#endif
+            for (int j = 0; j < n.l2; j++) sums[j] = dotPairs(x, &n.l1w[(size_t(bucket) * n.l2 + j) * HIDDEN]);
+    }
     for (int j = 0; j < n.l2; j++) h1[j] = screlu(float(sums[j]) * s1 + n.l1b[size_t(bucket) * n.l2 + j]);
     // l2 one input at a time across all outputs (weights stored [bucket][l2][l3] for that), so the outputs'
     // sums proceed side by side in vector registers; each still adds its terms in input order.
