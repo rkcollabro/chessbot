@@ -6,6 +6,8 @@
 #include <cstring>
 #include <vector>
 
+#include "largepages.h"
+
 #if defined(__AVX2__)
 #include <immintrin.h>
 #define NNUE_AVX2 1
@@ -36,7 +38,11 @@ struct Net {
     bool mirror = false;
     uint8_t kingBucket[64] = {};
     int activation = CRELU;
-    std::vector<int16_t> ftWeights;  // [kbuckets][INPUTS][HIDDEN]
+    // [kbuckets][INPUTS][HIDDEN]: 15.7 MB for the 1024-wide net, read a 2 KB row at a time at scattered places,
+    // so it lives on large pages when the OS allows (far fewer address-translation misses than 4 KB pages).
+    int16_t* ftWeights = nullptr;
+    size_t ftSize = 0;
+    bool ftLarge = false;
     alignas(64) int16_t ftBias[HIDDEN];
     int buckets = 1;  // output buckets, chosen by the number of pieces on the board
     int qb = QB_DEFAULT;
@@ -102,9 +108,15 @@ bool load(const std::string& path) {
         g_net.mirror = mirror != 0;
         g_net.activation = activation;
         std::memcpy(g_net.kingBucket, layout, 64);
-        g_net.ftWeights.resize(size_t(kbuckets) * INPUTS * HIDDEN);
+        const size_t n = size_t(kbuckets) * INPUTS * HIDDEN;
+        if (n != g_net.ftSize) {
+            freeLargePages(g_net.ftWeights);
+            g_net.ftWeights = static_cast<int16_t*>(allocLargePages(n * sizeof(int16_t), g_net.ftLarge));
+            g_net.ftSize = g_net.ftWeights ? n : 0;
+            ok = g_net.ftWeights != nullptr;
+        }
         g_net.outWeights.resize(size_t(buckets) * 2 * HIDDEN);
-        ok = std::fread(g_net.ftWeights.data(), 2, g_net.ftWeights.size(), f) == g_net.ftWeights.size() &&
+        ok = ok && std::fread(g_net.ftWeights, 2, n, f) == n &&
              std::fread(g_net.ftBias, 2, HIDDEN, f) == HIDDEN &&
              std::fread(g_net.outWeights.data(), 2, g_net.outWeights.size(), f) == g_net.outWeights.size() &&
              std::fread(g_net.outBias, 4, buckets, f) == size_t(buckets);
@@ -118,6 +130,7 @@ bool load(const std::string& path) {
 bool loaded() { return g_loaded; }
 void setEnabled(bool on) { g_enabled = on; }
 bool active() { return g_loaded && g_enabled; }
+bool weightsOnLargePages() { return g_loaded && g_net.ftLarge; }
 
 namespace {
 

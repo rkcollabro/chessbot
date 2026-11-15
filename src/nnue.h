@@ -12,5 +12,6 @@ bool load(const std::string& path);  // false if the file is missing or malforme
 bool loaded();
 void setEnabled(bool on);  // UCI "UseNNUE"; has no effect without a loaded network
 bool active();             // loaded and enabled
+bool weightsOnLargePages();  // the feature weights got large pages
 int evaluate(const Board& b);  // centipawns, side to move's point of view
 }  // namespace nnue
