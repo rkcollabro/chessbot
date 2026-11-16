@@ -172,7 +172,7 @@ bool load(const std::string& path) {
                                     g_net.l1w[(size_t(bk) * 16 + j) * HIDDEN + 2 * i + k];
                 g_net.l1wPairs = p;
             }
-#if defined(NNUE_AVX2) && !defined(NNUE_L1_I16)
+#if defined(NNUE_AVX2) && defined(NNUE_L1_I8)  // opt-in: measured 7-10% slower than the 16-bit l1 (2026-11-15)
             g_net.l1wQuads = nullptr;
             if (ok && l2 == 16) {
                 // u8 inputs (<= 254) times int8 weights, summed in pairs into int16 by maddubs: |w| <= 64 keeps
