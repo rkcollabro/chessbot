@@ -571,6 +571,41 @@ float layers(const NnueAccum& a, int stm, int bucket) {
 #endif
             for (int j = 0; j < n.l2; j++) sums[j] = dotPairs(x, &n.l1w[(size_t(bucket) * n.l2 + j) * HIDDEN]);
     }
+#if defined(NNUE_AVX2)
+    if (n.l2 == 16 && n.l3 == 32) {
+        // Fixed 16 -> 32 -> 1 in vector registers (the generic loops below did not vectorise and were most of
+        // the CBN3 cost): SCReLU of l1, then l2 one input at a time into 4 x 8 outputs, then l3 as 8 partial sums
+        // added in the same order as the generic code.
+        const __m256 zero = _mm256_setzero_ps(), one = _mm256_set1_ps(1.0f), vs1 = _mm256_set1_ps(s1);
+        auto act = [&](__m256 x) {
+            x = _mm256_min_ps(_mm256_max_ps(x, zero), one);
+            return _mm256_mul_ps(x, x);
+        };
+        const float* b1 = &n.l1b[size_t(bucket) * 16];
+        alignas(32) float a1[16];
+        for (int q = 0; q < 2; q++) {
+            __m256 x = _mm256_cvtepi32_ps(_mm256_loadu_si256((const __m256i*)(sums + 8 * q)));
+            _mm256_store_ps(a1 + 8 * q, act(_mm256_add_ps(_mm256_mul_ps(x, vs1), _mm256_loadu_ps(b1 + 8 * q))));
+        }
+        const float* w2 = &n.l2wT[size_t(bucket) * 16 * 32];
+        const float* b2 = &n.l2b[size_t(bucket) * 32];
+        __m256 o[4];
+        for (int q = 0; q < 4; q++) o[q] = _mm256_loadu_ps(b2 + 8 * q);
+        for (int j = 0; j < 16; j++) {
+            const __m256 hj = _mm256_set1_ps(a1[j]);
+            for (int q = 0; q < 4; q++)
+                o[q] = _mm256_add_ps(o[q], _mm256_mul_ps(_mm256_loadu_ps(w2 + j * 32 + 8 * q), hj));
+        }
+        const float* w3 = &n.l3w[size_t(bucket) * 32];
+        __m256 part = _mm256_setzero_ps();
+        for (int q = 0; q < 4; q++) part = _mm256_add_ps(part, _mm256_mul_ps(_mm256_loadu_ps(w3 + 8 * q), act(o[q])));
+        alignas(32) float pv[8];
+        _mm256_store_ps(pv, part);
+        float out = n.l3b[bucket];
+        for (int k = 0; k < 8; k++) out += pv[k];
+        return out;
+    }
+#endif
     for (int j = 0; j < n.l2; j++) h1[j] = screlu(float(sums[j]) * s1 + n.l1b[size_t(bucket) * n.l2 + j]);
     // l2 one input at a time across all outputs (weights stored [bucket][l2][l3] for that), so the outputs'
     // sums proceed side by side in vector registers; each still adds its terms in input order.
