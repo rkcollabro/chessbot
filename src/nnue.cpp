@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "largepages.h"
+#define NNUE_L1_I16 1  // test branch: 16-bit l1 with the vectorised layers
 
 #if defined(__AVX2__)
 #include <immintrin.h>
