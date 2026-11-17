@@ -147,49 +147,49 @@ constexpr bool F_CONT = SF & 1, F_CAP = SF & 2, F_NPCORR = SF & 4, F_RAZOR = SF 
 #define HP_MULT 2000
 #endif
 #ifndef RFP_MARGIN
-#define RFP_MARGIN 63
+#define RFP_MARGIN 61
 #endif
 #ifndef FUT_BASE
-#define FUT_BASE 113
+#define FUT_BASE 105
 #endif
 #ifndef FUT_MULT
-#define FUT_MULT 95
+#define FUT_MULT 100
 #endif
 #ifndef LMR_BASE
 #define LMR_BASE 104  // hundredths
 #endif
 #ifndef LMR_DIV
-#define LMR_DIV 210  // hundredths
+#define LMR_DIV 203  // hundredths
 #endif
 #ifndef NODE_TM
 #define NODE_TM 0  // 1: also scale the time target by the share of nodes spent on the best root move
 #endif
 #ifndef NMP_EVAL
-#define NMP_EVAL 201  // null-move reduction grows by one per this much eval above beta (up to 3)
+#define NMP_EVAL 188  // null-move reduction grows by one per this much eval above beta (up to 3)
 #endif
 #ifndef SEE_QUIET
-#define SEE_QUIET 58  // SEE pruning thresholds per depth
+#define SEE_QUIET 57  // SEE pruning thresholds per depth
 #endif
 #ifndef SEE_CAP
-#define SEE_CAP 61
+#define SEE_CAP 63
 #endif
 #ifndef DEXT_MARGIN
-#define DEXT_MARGIN 32  // singular-search margin below which the TT move gets a double extension
+#define DEXT_MARGIN 30  // singular-search margin below which the TT move gets a double extension
 #endif
 #ifndef LMR_HIST
-#define LMR_HIST 5754  // history per ply of LMR adjustment
+#define LMR_HIST 5412  // history per ply of LMR adjustment
 #endif
 #ifndef HIST_MULT
-#define HIST_MULT 21  // history bonus: min(HIST_MULT * depth^2, HIST_MAX)
+#define HIST_MULT 22  // history bonus: min(HIST_MULT * depth^2, HIST_MAX)
 #endif
 #ifndef HIST_MAX
-#define HIST_MAX 1824
+#define HIST_MAX 1768
 #endif
 #ifndef ASP_DELTA
-#define ASP_DELTA 22  // initial aspiration window half-width
+#define ASP_DELTA 21  // initial aspiration window half-width
 #endif
 #ifndef QS_FUT
-#define QS_FUT 130  // qsearch futility margin
+#define QS_FUT 133  // qsearch futility margin
 #endif
 
 // Search ideas from the engines that beat us (Stockfish, Coda, PZChessBot), each off by default so the build
