@@ -162,7 +162,7 @@ constexpr bool F_CONT = SF & 1, F_CAP = SF & 2, F_NPCORR = SF & 4, F_RAZOR = SF 
 #define LMR_DIV 210  // hundredths
 #endif
 #ifndef NODE_TM
-#define NODE_TM 0  // 1: also scale the time target by the share of nodes spent on the best root move
+#define NODE_TM 1  // 1: also scale the time target by the share of nodes spent on the best root move
 #endif
 #ifndef NMP_EVAL
 #define NMP_EVAL 201  // null-move reduction grows by one per this much eval above beta (up to 3)
