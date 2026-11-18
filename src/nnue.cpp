@@ -1,5 +1,7 @@
 #include "nnue.h"
 
+#define NNUE_L1_I8 1  // experiment: 8-bit l1 path
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
