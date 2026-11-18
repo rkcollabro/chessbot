@@ -491,6 +491,57 @@ void l1Sparse(const int16_t* x, const int16_t* wp, int32_t* out) {
     _mm256_storeu_si256((__m256i*)out, s0);
     _mm256_storeu_si256((__m256i*)(out + 8), s1);
 }
+
+// pairwise of both perspectives (side to move first) and l1Sparse in one function: the nonzero pair indices
+// are found from the products while they are still in registers, and the sparse loop takes two pairs per step
+// into separate sums. Integer arithmetic throughout, so the result equals pairwise + l1Sparse exactly.
+void l1Fused(const int16_t* accStm, const int16_t* accNtm, const int16_t* wp, int32_t* out) {
+    constexpr int H = HIDDEN / 2;
+    alignas(32) int16_t x[HIDDEN];
+    alignas(16) uint16_t nz[HIDDEN / 2 + 8];
+    int n = 0;
+    const __m256i zero = _mm256_setzero_si256(), qa = _mm256_set1_epi16(QA);
+    __m128i base = _mm_setzero_si128();
+    const __m128i eight = _mm_set1_epi16(8);
+    auto cl = [&](const int16_t* p) {
+        return _mm256_min_epi16(_mm256_max_epi16(_mm256_loadu_si256((const __m256i*)p), zero), qa);
+    };
+    for (int h = 0; h < 2; h++) {
+        const int16_t* acc = h ? accNtm : accStm;
+        int16_t* xo = x + h * H;
+        for (int i = 0; i < H; i += 16) {
+            const __m256i v = _mm256_srli_epi16(_mm256_mullo_epi16(cl(acc + i), cl(acc + H + i)), PAIR_SHIFT);
+            _mm256_store_si256((__m256i*)(xo + i), v);
+            unsigned m = ~unsigned(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, zero)))) & 0xFF;
+            _mm_storeu_si128((__m128i*)(nz + n), _mm_add_epi16(base, _mm_load_si128((const __m128i*)g_nzTable.idx[m])));
+            n += _mm_popcnt_u32(m);
+            base = _mm_add_epi16(base, eight);
+        }
+    }
+    const int32_t* x32 = reinterpret_cast<const int32_t*>(x);
+    __m256i s0 = _mm256_setzero_si256(), s1 = _mm256_setzero_si256();
+    __m256i t0 = _mm256_setzero_si256(), t1 = _mm256_setzero_si256();
+    int k = 0;
+    for (; k + 1 < n; k += 2) {
+        const int p = nz[k], q = nz[k + 1];
+        const __m256i inp = _mm256_set1_epi32(x32[p]), inq = _mm256_set1_epi32(x32[q]);
+        const int16_t* wpp = wp + size_t(p) * 32;
+        const int16_t* wqq = wp + size_t(q) * 32;
+        s0 = _mm256_add_epi32(s0, _mm256_madd_epi16(inp, _mm256_load_si256((const __m256i*)wpp)));
+        s1 = _mm256_add_epi32(s1, _mm256_madd_epi16(inp, _mm256_load_si256((const __m256i*)(wpp + 16))));
+        t0 = _mm256_add_epi32(t0, _mm256_madd_epi16(inq, _mm256_load_si256((const __m256i*)wqq)));
+        t1 = _mm256_add_epi32(t1, _mm256_madd_epi16(inq, _mm256_load_si256((const __m256i*)(wqq + 16))));
+    }
+    if (k < n) {
+        const int p = nz[k];
+        const __m256i inp = _mm256_set1_epi32(x32[p]);
+        const int16_t* wpp = wp + size_t(p) * 32;
+        s0 = _mm256_add_epi32(s0, _mm256_madd_epi16(inp, _mm256_load_si256((const __m256i*)wpp)));
+        s1 = _mm256_add_epi32(s1, _mm256_madd_epi16(inp, _mm256_load_si256((const __m256i*)(wpp + 16))));
+    }
+    _mm256_storeu_si256((__m256i*)out, _mm256_add_epi32(s0, t0));
+    _mm256_storeu_si256((__m256i*)(out + 8), _mm256_add_epi32(s1, t1));
+}
 #endif
 
 #if defined(NNUE_AVX2)
@@ -559,17 +610,19 @@ float layers(const NnueAccum& a, int stm, int bucket) {
     } else
 #endif
     {
-        alignas(32) int16_t x[HIDDEN];
-        pairwise(a.v[stm], x);
-        pairwise(a.v[stm ^ 1], x + HIDDEN / 2);
         // x = trained product * QA * QA >> PAIR_SHIFT, and the weights are scaled by qb.
         s1 = float(1 << PAIR_SHIFT) / (float(QA) * QA * n.qb);
 #if defined(NNUE_AVX2)
         if (n.l2 == 16)
-            l1Sparse(x, n.l1wPairs + size_t(bucket) * (HIDDEN / 2) * 32, sums);
+            l1Fused(a.v[stm], a.v[stm ^ 1], n.l1wPairs + size_t(bucket) * (HIDDEN / 2) * 32, sums);
         else
 #endif
+        {
+            alignas(32) int16_t x[HIDDEN];
+            pairwise(a.v[stm], x);
+            pairwise(a.v[stm ^ 1], x + HIDDEN / 2);
             for (int j = 0; j < n.l2; j++) sums[j] = dotPairs(x, &n.l1w[(size_t(bucket) * n.l2 + j) * HIDDEN]);
+        }
     }
 #if defined(NNUE_AVX2)
     if (n.l2 == 16 && n.l3 == 32) {
